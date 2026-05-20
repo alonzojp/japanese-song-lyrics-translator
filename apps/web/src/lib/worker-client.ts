@@ -1,8 +1,10 @@
 import type {
   CreateJobRequest,
   CreateJobResponse,
+  FetchLyricsRequest,
   Job,
   JobResult,
+  LyricsResult,
   WorkerHealth,
 } from "@japanese-lyrics/shared";
 
@@ -26,15 +28,14 @@ async function workerFetch<T>(path: string, init?: RequestInit): Promise<T> {
 }
 
 export const workerClient = {
+  // ── Health ──────────────────────────────────────────────────────────────────
   health(): Promise<WorkerHealth> {
     return workerFetch("/health");
   },
 
+  // ── Jobs ────────────────────────────────────────────────────────────────────
   createJob(body: CreateJobRequest): Promise<CreateJobResponse> {
-    return workerFetch("/jobs", {
-      method: "POST",
-      body: JSON.stringify(body),
-    });
+    return workerFetch("/jobs", { method: "POST", body: JSON.stringify(body) });
   },
 
   getJob(jobId: string): Promise<Job> {
@@ -43,5 +44,21 @@ export const workerClient = {
 
   getResult(jobId: string): Promise<JobResult> {
     return workerFetch(`/jobs/${jobId}/result`);
+  },
+
+  // ── Lyrics ──────────────────────────────────────────────────────────────────
+  fetchLyrics(body: FetchLyricsRequest): Promise<LyricsResult> {
+    return workerFetch("/lyrics/fetch", { method: "POST", body: JSON.stringify(body) });
+  },
+
+  getLyrics(youtubeId: string): Promise<LyricsResult> {
+    return workerFetch(`/lyrics/${youtubeId}`);
+  },
+
+  uploadManualLyrics(youtubeId: string, text: string): Promise<{ youtubeId: string; storedAt: string }> {
+    return workerFetch(`/lyrics/${youtubeId}/manual`, {
+      method: "POST",
+      body: JSON.stringify({ text }),
+    });
   },
 };

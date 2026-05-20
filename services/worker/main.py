@@ -14,10 +14,15 @@ from pathlib import Path
 from fastapi import BackgroundTasks, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field
+from typing import Optional
 
 from cache import cleanup_old, list_cached
 from config import CACHE_MAX_AGE_DAYS, WHISPER_MODEL, WORKER_CONCURRENCY
 from logs import get_recent_logs
+from lyrics.fetcher import fetch_lyrics, get_cached as get_cached_lyrics
+from lyrics.providers.manual import store_manual
+from lyrics.types import VideoInfo
 from models import CreateJobRequest, JobStatus, WorkerHealth
 from pipeline import run_job
 from queue import create_job, get_job, get_queue_depth, get_result_path
@@ -145,6 +150,57 @@ async def get_result_endpoint(job_id: str) -> dict:
     data["jobId"]  = job_id
     data["songId"] = job.song_id
     return data
+
+
+# ── Lyrics ─────────────────────────────────────────────────────────────────────
+
+class FetchLyricsRequest(BaseModel):
+    youtube_id:  str = Field(alias="youtubeId")
+    youtube_url: str = Field(alias="youtubeUrl")
+    title:       Optional[str] = None
+    uploader:    Optional[str] = None
+    description: Optional[str] = None
+    duration:    Optional[float] = None
+    force:       bool = False
+
+    model_config = {"populate_by_name": True}
+
+
+@app.post("/lyrics/fetch")
+async def fetch_lyrics_endpoint(body: FetchLyricsRequest) -> dict:
+    """
+    Fetch lyrics via the provider chain. Returns cached result if available.
+    Pass force=true to bypass cache and re-run all providers.
+    """
+    video = VideoInfo(
+        youtube_id=body.youtube_id,
+        youtube_url=body.youtube_url,
+        title=body.title,
+        uploader=body.uploader,
+        description=body.description,
+        duration=body.duration,
+    )
+    result = await fetch_lyrics(video, force=body.force)
+    return result
+
+
+@app.get("/lyrics/{youtube_id}")
+async def get_lyrics_endpoint(youtube_id: str) -> dict:
+    """Return cached lyrics for a video (404 if not yet fetched)."""
+    cached = get_cached_lyrics(youtube_id)
+    if not cached:
+        raise HTTPException(status_code=404, detail="No cached lyrics for this video")
+    return cached
+
+
+@app.post("/lyrics/{youtube_id}/manual", status_code=201)
+async def upload_manual_lyrics(youtube_id: str, body: dict) -> dict:
+    """Store user-provided lyrics text as a manual override."""
+    text = body.get("text", "").strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="text is required")
+    path = store_manual(youtube_id, text)
+    return {"youtubeId": youtube_id, "storedAt": str(path)}
 
 
 # ── Entry point ────────────────────────────────────────────────────────────────
