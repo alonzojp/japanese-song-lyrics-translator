@@ -26,6 +26,7 @@ from config import CACHE_DIR, SKIP_VOCAL_SEPARATION, WHISPER_MODEL
 from logs import JobLogger
 from models import JobStatus
 from queue import get_job, set_job_status, update_job_step
+from alignment.matcher import run_offline_match
 from steps.download import download_audio
 from steps.separate import separate_vocals
 from steps.transcribe import run_transcription
@@ -147,6 +148,18 @@ def run_job(job_id: str) -> None:
         update_job_step(job_id, "align", JobStatus.completed, 100, 100)
 
         cleanup_temp_files(yt_id)
+
+        # ── Optional step 5: offline DTW match against official lyrics ─────────
+        # Runs only if lyrics_cached.json exists (from the lyrics provider system).
+        try:
+            match_result = run_offline_match(job_cache, yt_id, job_log=jl)
+            if match_result:
+                jl.info(
+                    f"Offline match: {len(match_result['lines'])} lines, "
+                    f"avg_conf={match_result['stats'].get('avgConfidence', 0):.2f}",
+                )
+        except Exception as match_exc:
+            jl.warning(f"Offline match skipped: {match_exc}")
 
         result_path = str(job_cache / "lyrics.json")
         set_job_status(job_id, JobStatus.completed, result_path=result_path)

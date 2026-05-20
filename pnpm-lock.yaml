@@ -117,6 +117,9 @@ importers:
 
   packages/alignment:
     dependencies:
+      '@japanese-lyrics/japanese-processing':
+        specifier: workspace:*
+        version: link:../japanese-processing
       '@japanese-lyrics/shared':
         specifier: workspace:*
         version: link:../shared

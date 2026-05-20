@@ -17,7 +17,8 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from typing import Optional
 
-from cache import cleanup_old, list_cached
+from alignment.matcher import match_lyric_lines, run_offline_match
+from cache import cache_dir, cleanup_old, list_cached
 from config import CACHE_MAX_AGE_DAYS, WHISPER_MODEL, WORKER_CONCURRENCY
 from logs import get_recent_logs
 from lyrics.fetcher import fetch_lyrics, get_cached as get_cached_lyrics
@@ -213,6 +214,50 @@ async def upload_manual_lyrics(youtube_id: str, body: dict) -> dict:
         raise HTTPException(status_code=400, detail="text is required")
     path = store_manual(youtube_id, text)
     return {"youtubeId": youtube_id, "storedAt": str(path)}
+
+
+# ── Alignment matching ────────────────────────────────────────────────────────
+
+@app.get("/alignment/{youtube_id}/matched")
+async def get_matched_lyrics(youtube_id: str) -> dict:
+    """
+    Return the offline DTW-matched lyrics for a video.
+    Produced by match_lyric_lines(transcript, officialLyrics).
+    404 if not yet computed.
+    """
+    matched_path = cache_dir(youtube_id) / "matched_lyrics.json"
+    if not matched_path.exists():
+        raise HTTPException(status_code=404, detail="No matched lyrics — run /alignment/{id}/match first")
+    return json.loads(matched_path.read_text(encoding="utf-8"))
+
+
+@app.post("/alignment/{youtube_id}/match")
+async def trigger_match(youtube_id: str) -> dict:
+    """
+    Trigger offline DTW alignment: match official lyrics to transcript.
+    Requires both aligned_words.json and lyrics_cached.json to exist.
+    """
+    job_cache = cache_dir(youtube_id)
+    result    = run_offline_match(job_cache, youtube_id)
+    if not result:
+        raise HTTPException(
+            status_code=409,
+            detail="Missing aligned_words.json or lyrics_cached.json — process the video and fetch lyrics first",
+        )
+    return result
+
+
+@app.post("/alignment/match-inline")
+async def match_inline(body: dict) -> dict:
+    """
+    Run DTW alignment directly on provided transcript + lyrics data.
+    Body: { transcript: [{text, startTime, endTime}], officialLines: [{index, text}] }
+    """
+    transcript     = body.get("transcript", [])
+    official_lines = body.get("officialLines", [])
+    if not transcript or not official_lines:
+        raise HTTPException(status_code=400, detail="transcript and officialLines are required")
+    return match_lyric_lines(transcript, official_lines)
 
 
 # ── Entry point ────────────────────────────────────────────────────────────────
