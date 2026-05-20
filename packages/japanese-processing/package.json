@@ -14,9 +14,13 @@
     "lint": "eslint src"
   },
   "dependencies": {
-    "@japanese-lyrics/shared": "workspace:*"
+    "@japanese-lyrics/shared": "workspace:*",
+    "kuromoji": "^0.1.2",
+    "wanakana": "^5.3.1"
   },
   "devDependencies": {
+    "@types/kuromoji": "^0.1.2",
+    "@types/node": "^20.14.0",
     "typescript": "^5.5.0"
   }
 }
