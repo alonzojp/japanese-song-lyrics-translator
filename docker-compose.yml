@@ -1,6 +1,13 @@
 version: "3.9"
 
+# ── Shared cache volume (audio + lyrics.json) ──────────────────────────────────
+volumes:
+  cache_data:
+  sqlite_data:
+
 services:
+
+  # ── Next.js frontend + API gateway ──────────────────────────────────────────
   web:
     build:
       context: .
@@ -8,12 +15,16 @@ services:
     ports:
       - "3000:3000"
     environment:
-      - NODE_ENV=production
-      - DATABASE_URL=file:/data/prod.db
-      - GROQ_API_KEY=${GROQ_API_KEY}
-      - NEXT_PUBLIC_APP_URL=${NEXT_PUBLIC_APP_URL:-http://localhost:3000}
+      NODE_ENV:               production
+      DATABASE_URL:           file:/data/prod.db
+      WORKER_URL:             http://worker:8000
+      NEXT_PUBLIC_APP_URL:    ${NEXT_PUBLIC_APP_URL:-http://localhost:3000}
+      GROQ_API_KEY:           ${GROQ_API_KEY:-}
     volumes:
       - sqlite_data:/data
+    depends_on:
+      worker:
+        condition: service_healthy
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://localhost:3000/api/health"]
@@ -22,6 +33,46 @@ services:
       retries: 3
       start_period: 40s
 
-volumes:
-  sqlite_data:
-    driver: local
+  # ── Python audio processing worker ────────────────────────────────────────────
+  worker:
+    build:
+      context: ./services/worker
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    environment:
+      HOST:                   0.0.0.0
+      PORT:                   8000
+      CACHE_DIR:              /cache
+      WHISPER_MODEL:          ${WHISPER_MODEL:-large-v3}
+      WHISPER_DEVICE:         ${WHISPER_DEVICE:-auto}
+      WHISPER_COMPUTE_TYPE:   ${WHISPER_COMPUTE_TYPE:-auto}
+      WHISPER_BATCH_SIZE:     ${WHISPER_BATCH_SIZE:-16}
+      SKIP_VOCAL_SEPARATION:  ${SKIP_VOCAL_SEPARATION:-false}
+      CORS_ORIGINS:           http://localhost:3000,http://web:3000
+    volumes:
+      - cache_data:/cache
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s   # whisperx model load can be slow on first start
+
+  # ── GPU variant (optional — uncomment to enable CUDA) ─────────────────────────
+  # worker-gpu:
+  #   extends:
+  #     service: worker
+  #   build:
+  #     context: ./services/worker
+  #     dockerfile: Dockerfile
+  #     args:
+  #       BASE_IMAGE: pytorch/pytorch:2.4.0-cuda12.1-cudnn9-runtime
+  #   deploy:
+  #     resources:
+  #       reservations:
+  #         devices:
+  #           - driver: nvidia
+  #             count: 1
+  #             capabilities: [gpu]

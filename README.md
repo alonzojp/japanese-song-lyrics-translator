@@ -1,55 +1,115 @@
 # Japanese Song Lyrics Translator
 
-Learn Japanese through music. Paste a YouTube URL to get furigana readings, word-by-word translations, and karaoke-style lyric highlighting.
+Learn Japanese through music. Paste a YouTube URL to get furigana readings, word-by-word translations, and karaoke-style lyric highlighting — all running locally with no paid APIs.
 
-## Features
+## Architecture
 
-- **Furigana & Romaji** — every kanji annotated with its reading
-- **AI-powered analysis** — per-word breakdown, grammar points, JLPT levels (via Groq / Llama 3.3)
-- **Dictionary lookups** — Jotoba + Jisho fallback when no AI key is set
-- **Anki integration** — one-click card export with styled front/back HTML
-- **Karaoke player** — YouTube embed with lyrics panel *(timing sync coming soon)*
-- **SQLite + Prisma** — lyrics and analysis cached locally
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  Browser                                                        │
+│  Next.js frontend (React + TypeScript + Tailwind)               │
+│  • YouTube URL input                                            │
+│  • Job progress polling (every 2.5 s)                           │
+│  • Karaoke lyrics display                                       │
+└──────────────────┬──────────────────────────────────────────────┘
+                   │  HTTP
+                   ▼
+┌─────────────────────────────────────────────────────────────────┐
+│  Next.js API Gateway (lightweight)                              │
+│  POST /api/jobs         → submit job to Python worker           │
+│  GET  /api/jobs/[id]    → proxy poll + sync lyrics to DB        │
+│  POST /api/songs        → upsert song record                    │
+│  GET  /api/songs/[id]/lyrics → serve cached lyrics              │
+│                                                                 │
+│  SQLite (Prisma)  — songs + lyric lines                        │
+└──────────────────┬──────────────────────────────────────────────┘
+                   │  HTTP  (WORKER_URL)
+                   ▼
+┌─────────────────────────────────────────────────────────────────┐
+│  Python FastAPI Worker  (services/worker)                       │
+│                                                                 │
+│  Job queue (SQLite)                                             │
+│  ┌──────────────────────────────────────────────────────────┐  │
+│  │  queued → processing → completed / failed                │  │
+│  └──────────────────────────────────────────────────────────┘  │
+│                                                                 │
+│  Pipeline steps (background thread)                            │
+│  1. download   — yt-dlp   → audio.wav                          │
+│  2. separate   — Demucs   → vocals.wav   (skippable)           │
+│  3. transcribe — WhisperX → word-level timestamps              │
+│  4. align      — post-process → lyrics.json                    │
+│                                                                 │
+│  Filesystem cache  /cache/{youtubeId}/                         │
+│    audio.wav  |  vocals.wav  |  lyrics.json                    │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### Design principles
+- **Zero paid APIs by default** — local Whisper, local Demucs, local everything
+- **Filesystem caching** — re-running a song skips already-completed steps
+- **GPU optional** — falls back to CPU automatically (slower but works everywhere)
+- **OpenAI API is entirely optional** — used only if you set `GROQ_API_KEY` for AI word analysis
+
+---
 
 ## Monorepo Structure
 
 ```
 japanese-song-lyrics-translator/
 ├── apps/
-│   └── web/                        # Next.js 14 app (App Router)
-│       ├── src/app/                # Pages & API routes
+│   └── web/                        # Next.js 14 app
+│       ├── src/app/                # Pages + API routes
 │       ├── src/components/         # React components + shadcn/ui
-│       ├── src/lib/                # Prisma client, utilities
-│       └── prisma/schema.prisma    # SQLite schema
+│       ├── src/lib/                # Prisma client, worker client
+│       └── prisma/schema.prisma    # SQLite schema (songs + lyric lines)
+│
+├── services/
+│   └── worker/                     # Python FastAPI audio processing worker
+│       ├── main.py                 # FastAPI app + routes
+│       ├── pipeline.py             # Job orchestrator
+│       ├── queue.py                # SQLite job queue
+│       ├── models.py               # Pydantic models (mirrors TS types)
+│       ├── config.py               # Env-var config
+│       └── steps/
+│           ├── download.py         # yt-dlp
+│           ├── separate.py         # Demucs vocal isolation
+│           ├── transcribe.py       # WhisperX ASR + alignment
+│           └── align.py            # Post-processing → lyrics.json
 │
 └── packages/
-    ├── shared/                     # Shared TypeScript types & parseJSON util
-    ├── japanese-processing/        # Segmenter, romaji, furigana utilities
-    ├── alignment/                  # Lyric timing types (sync scaffold)
-    ├── providers/                  # Groq, Jotoba, Jisho API clients
-    └── anki/                       # Anki card builder & deep-link URL generator
+    ├── shared/                     # TS types + API contract (Job, TranscribedLine…)
+    ├── japanese-processing/        # Furigana, romaji, segmenter
+    ├── providers/                  # Groq, Jotoba, Jisho clients
+    ├── anki/                       # Anki card builder
+    └── alignment/                  # Alignment type scaffolding
 ```
+
+---
 
 ## Quick Start
 
 ### Prerequisites
 
-- Node.js 20+
-- pnpm 9+
+| Tool | Version | Notes |
+|---|---|---|
+| Node.js | 20+ | |
+| pnpm | 9+ | `npm install -g pnpm` |
+| Python | 3.10+ | For the worker |
+| ffmpeg | any | `winget install ffmpeg` / `brew install ffmpeg` |
 
-### 1. Clone & install
+### 1. Clone & install Node deps
 
 ```bash
-git clone <repo-url>
+git clone https://github.com/alonzojp/japanese-song-lyrics-translator
 cd japanese-song-lyrics-translator
 pnpm install
 ```
 
-### 2. Configure environment
+### 2. Configure Next.js
 
 ```bash
-cp .env.example apps/web/.env.local
-# Edit apps/web/.env.local — set GROQ_API_KEY and DATABASE_URL
+cp apps/web/.env.local.example apps/web/.env.local
+# Edit apps/web/.env.local — set GROQ_API_KEY if you want AI word analysis
 ```
 
 ### 3. Set up the database
@@ -58,101 +118,123 @@ cp .env.example apps/web/.env.local
 pnpm --filter @japanese-lyrics/web db:push
 ```
 
-### 4. Run development server
+### 4. Set up the Python worker
 
 ```bash
-pnpm dev
-# Opens http://localhost:3000
+cd services/worker
+python -m venv .venv
+# Windows:
+.venv\Scripts\activate
+# macOS/Linux:
+source .venv/bin/activate
+
+# Install PyTorch first (CPU build — faster to download):
+pip install torch torchaudio --index-url https://download.pytorch.org/whl/cpu
+
+# Then the rest:
+pip install -r requirements.txt
+
+# Copy and edit env:
+cp .env.example .env
 ```
+
+### 5. Run both services
+
+**Terminal 1 — Next.js:**
+```bash
+pnpm dev
+```
+
+**Terminal 2 — Python worker:**
+```bash
+cd services/worker
+python main.py
+```
+
+Open http://localhost:3000, paste a Japanese song URL, click **Start Processing**.
+
+---
 
 ## Environment Variables
 
-Copy `.env.example` to `apps/web/.env.local`:
+### `apps/web/.env.local`
 
-| Variable | Required | Description |
+| Variable | Required | Default | Description |
+|---|---|---|---|
+| `DATABASE_URL` | Yes | `file:./dev.db` | SQLite path |
+| `WORKER_URL` | Yes | `http://localhost:8000` | Python worker URL |
+| `GROQ_API_KEY` | No | — | Enables AI word analysis (optional) |
+| `NEXT_PUBLIC_APP_URL` | No | `http://localhost:3000` | Public URL |
+
+### `services/worker/.env`
+
+| Variable | Default | Description |
 |---|---|---|
-| `DATABASE_URL` | Yes | SQLite path, e.g. `file:./dev.db` |
-| `GROQ_API_KEY` | Optional | Enables AI analysis (Llama 3.3 via Groq) |
-| `YOUTUBE_API_KEY` | Optional | Fetches video title/artist metadata |
-| `NEXT_PUBLIC_APP_URL` | Optional | Public URL for the app |
+| `WHISPER_MODEL` | `large-v3` | Whisper model size (tiny/base/small/medium/large-v3) |
+| `WHISPER_DEVICE` | `auto` | `auto` \| `cpu` \| `cuda` |
+| `WHISPER_COMPUTE_TYPE` | `auto` | `int8` (CPU) \| `float16` (GPU) |
+| `SKIP_VOCAL_SEPARATION` | `false` | Skip Demucs (faster, less accurate on noisy songs) |
+| `CACHE_DIR` | `./cache` | Where to store audio + lyrics files |
 
-## Package Scripts
+---
 
-```bash
-pnpm dev              # Start all packages in watch mode
-pnpm build            # Production build
-pnpm lint             # ESLint across all packages
-pnpm type-check       # TypeScript check across all packages
-pnpm format           # Prettier format
+## Job Queue States
 
-# Database (run from apps/web or use --filter)
-pnpm --filter @japanese-lyrics/web db:push     # Sync schema → DB (dev)
-pnpm --filter @japanese-lyrics/web db:migrate  # Create migration
-pnpm --filter @japanese-lyrics/web db:studio   # Open Prisma Studio
 ```
+POST /api/jobs
+      ↓
+   queued         # job created, waiting for thread
+      ↓
+  processing      # one of: download → separate → transcribe → align
+      ↓
+  completed  ──→  lyrics stored in SQLite, served to frontend
+  failed     ──→  error message returned, retry available
+```
+
+---
 
 ## Docker
 
 ```bash
-# Build and run
+# Build and start both services:
 docker compose up --build
 
-# With your API key
+# With custom Whisper model (medium = faster, less accurate):
+WHISPER_MODEL=medium docker compose up
+
+# With Groq AI analysis:
 GROQ_API_KEY=gsk_xxx docker compose up
 ```
 
-## Packages
+### GPU support
 
-### `@japanese-lyrics/shared`
-Shared TypeScript types (`Token`, `AnalysisResult`, `LyricLine`, `Song`) and the `parseJSON` utility for robust AI response parsing.
+Uncomment the `worker-gpu` service in `docker-compose.yml` (requires NVIDIA Docker runtime).
 
-### `@japanese-lyrics/japanese-processing`
-Ported from the original `japanese-translator` project:
-- `segmentText(text)` — Japanese word segmentation via `Intl.Segmenter`
-- `toRomaji(kana)` — Hepburn romanization converter
-- `furiganaToRuby(text)` — Converts `食(た)べる` format to `<ruby>` HTML
-- `alignFurigana(surface, reading)` — Strips kana suffix for precise kanji ruby
-- `buildRubyHTML(surface, reading, furigana)` — Full ruby HTML builder
-- `buildRubyFromTokens(tokens)` — Sentence-level ruby from token array
-- `looksLikeReading(s)` — Heuristic: detects kana-only strings
+---
 
-### `@japanese-lyrics/providers`
-API clients ported from the original project:
-- `analyzeWithGroq(text, apiKey)` — Full AI analysis via Groq / Llama 3.3
-- `lookupJotoba(word)` — Jotoba dictionary lookup
-- `lookupJisho(word)` — Jisho dictionary lookup (with CORS proxy fallback)
-- `basicLookup(word)` — Tries Jotoba then Jisho
+## Package Scripts
 
-### `@japanese-lyrics/anki`
-Anki integration ported from the original project:
-- `buildAnkiFront(token)` — Styled HTML for card front
-- `buildAnkiBack(token, ctx)` — Styled HTML for card back (with sentence context)
-- `buildAnkiUrl(token, opts)` — `anki://x-callback-url/addnote` deep link
+```bash
+pnpm dev                                          # start Next.js dev server
+pnpm build                                        # production build
+pnpm type-check                                   # TypeScript check all packages
+pnpm lint                                         # ESLint all packages
 
-### `@japanese-lyrics/alignment`
-Placeholder for future lyric timing synchronization:
-- Whisper-based forced alignment (planned)
-- Manual timestamp editor helpers (planned)
-- Confidence scoring (planned)
+pnpm --filter @japanese-lyrics/web db:push        # sync schema → SQLite (dev)
+pnpm --filter @japanese-lyrics/web db:studio      # open Prisma Studio
+```
+
+---
 
 ## Roadmap
 
-- [ ] YouTube metadata fetching (title, artist, thumbnail)
-- [ ] Lyrics import (manual paste / auto-fetch)
-- [ ] AI analysis pipeline for all lyric lines
-- [ ] Lyric timing synchronization (Whisper forced alignment)
-- [ ] Karaoke highlighting in sync with video playback
-- [ ] Word-click analysis panel
+- [x] Monorepo scaffolding
+- [x] YouTube URL input + song storage
+- [x] Python worker architecture (yt-dlp + Demucs + WhisperX)
+- [x] Job queue (queued → processing → completed/failed)
+- [x] Live progress polling in the UI
+- [ ] Lyrics display with word-level highlighting
+- [ ] AI word analysis (furigana + translation per line)
 - [ ] Anki export from player view
-
-## Tech Stack
-
-| Layer | Technology |
-|---|---|
-| Framework | Next.js 14 (App Router) |
-| Language | TypeScript 5 |
-| Styling | Tailwind CSS + shadcn/ui |
-| Database | Prisma + SQLite |
-| AI | Groq API (Llama 3.3 70B) |
-| Monorepo | pnpm workspaces + Turborepo |
-| Container | Docker + Compose |
+- [ ] Manual lyrics editor + timestamp correction
+- [ ] YouTube metadata fetch (title, artist)

@@ -1,0 +1,25 @@
+# ── Web server ─────────────────────────────────────────────────────────────────
+fastapi==0.115.0
+uvicorn[standard]==0.30.6
+pydantic==2.9.2
+
+# ── Audio download ─────────────────────────────────────────────────────────────
+yt-dlp==2024.9.27
+
+# ── Audio processing ───────────────────────────────────────────────────────────
+# ffmpeg-python wraps the ffmpeg CLI (ffmpeg binary must be installed separately)
+ffmpeg-python==0.2.0
+soundfile==0.12.1
+
+# ── Vocal separation ───────────────────────────────────────────────────────────
+# Demucs pulls in torch — install torch first per https://pytorch.org/get-started/
+demucs==4.0.1
+
+# ── Transcription + forced alignment ──────────────────────────────────────────
+# whisperx requires torch + torchaudio (installed via demucs above)
+# Install with: pip install git+https://github.com/m-bain/whisperX.git
+# whisperx is listed below as a direct git ref for reproducibility
+git+https://github.com/m-bain/whisperX.git@v3.1.5
+
+# ── Utilities ──────────────────────────────────────────────────────────────────
+python-dotenv==1.0.1

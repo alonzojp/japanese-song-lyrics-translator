@@ -4,8 +4,7 @@ import { ArrowLeft } from "lucide-react";
 import Link from "next/link";
 import { KaraokePlayer } from "@/components/karaoke-player";
 import { prisma } from "@/lib/prisma";
-import type { AnalysisResult, Token } from "@japanese-lyrics/shared";
-import type { LyricLine } from "@japanese-lyrics/shared";
+import type { AnalysisResult, LyricLine, Token } from "@japanese-lyrics/shared";
 
 interface PlayerPageProps {
   params: { id: string };
@@ -19,24 +18,22 @@ async function getSong(id: string) {
   if (!song) return null;
 
   const lyrics: LyricLine[] = song.lyrics.map((line) => ({
-    index: line.lineIndex,
+    index:     line.lineIndex,
     startTime: line.startTime,
-    endTime: line.endTime,
-    japanese: line.japanese,
-    tokens: line.tokens ? (JSON.parse(line.tokens) as Token[]) : null,
-    analysis: line.analysis ? (JSON.parse(line.analysis) as AnalysisResult) : null,
+    endTime:   line.endTime,
+    japanese:  line.japanese,
+    tokens:    line.tokens   ? (JSON.parse(line.tokens)   as Token[])         : null,
+    analysis:  line.analysis ? (JSON.parse(line.analysis) as AnalysisResult)  : null,
   }));
 
   return {
-    id: song.id,
-    youtubeUrl: song.youtubeUrl,
-    youtubeId: song.youtubeId,
-    title: song.title,
-    artist: song.artist,
-    thumbnail: song.thumbnail,
+    id:               song.id,
+    youtubeId:        song.youtubeId,
+    title:            song.title,
+    artist:           song.artist,
+    currentJobId:     song.currentJobId,
+    processingStatus: song.processingStatus,
     lyrics,
-    createdAt: song.createdAt,
-    updatedAt: song.updatedAt,
   };
 }
 
@@ -44,8 +41,8 @@ export async function generateMetadata({ params }: PlayerPageProps): Promise<Met
   const song = await getSong(params.id);
   if (!song) return { title: "Not Found" };
   return {
-    title: song.title ?? "Song Player",
-    description: song.artist ? `${song.title} by ${song.artist}` : song.title ?? undefined,
+    title:       song.title ?? "Song Player",
+    description: song.artist ? `${song.title} by ${song.artist}` : (song.title ?? undefined),
   };
 }
 
@@ -63,7 +60,15 @@ export default async function PlayerPage({ params }: PlayerPageProps) {
         Back to home
       </Link>
 
-      <KaraokePlayer song={song} />
+      <KaraokePlayer
+        songId={song.id}
+        youtubeId={song.youtubeId}
+        title={song.title ?? null}
+        artist={song.artist ?? null}
+        initialJobId={song.currentJobId ?? null}
+        initialStatus={song.processingStatus ?? null}
+        initialLyrics={song.lyrics}
+      />
     </main>
   );
 }

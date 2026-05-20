@@ -1,6 +1,3 @@
-// This is your Prisma schema file,
-// learn more about it in the docs: https://pris.ly/d/prisma-schema
-
 generator client {
   provider = "prisma-client-js"
 }
@@ -11,14 +8,17 @@ datasource db {
 }
 
 model Song {
-  id         String   @id @default(cuid())
-  youtubeUrl String   @unique
-  youtubeId  String   @unique
-  title      String?
-  artist     String?
-  thumbnail  String?
-  createdAt  DateTime @default(now())
-  updatedAt  DateTime @updatedAt
+  id               String    @id @default(cuid())
+  youtubeUrl       String    @unique
+  youtubeId        String    @unique
+  title            String?
+  artist           String?
+  thumbnail        String?
+  // Job tracking — set when a processing job is submitted to the Python worker
+  currentJobId     String?
+  processingStatus String?   // mirrors JobStatus: queued | processing | completed | failed
+  createdAt        DateTime  @default(now())
+  updatedAt        DateTime  @updatedAt
 
   lyrics LyricLine[]
 }
@@ -31,8 +31,9 @@ model LyricLine {
   startTime Float?
   endTime   Float?
   japanese  String
-  tokens    String?  // JSON: Token[]
-  analysis  String?  // JSON: AnalysisResult
+  words     String?  // JSON: LyricWord[]  (word-level timestamps from WhisperX)
+  tokens    String?  // JSON: Token[]      (morphological analysis)
+  analysis  String?  // JSON: AnalysisResult (AI translation/breakdown)
   createdAt DateTime @default(now())
 
   @@index([songId, lineIndex])
