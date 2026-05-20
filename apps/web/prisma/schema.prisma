@@ -1,0 +1,39 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+model Song {
+  id         String   @id @default(cuid())
+  youtubeUrl String   @unique
+  youtubeId  String   @unique
+  title      String?
+  artist     String?
+  thumbnail  String?
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  lyrics LyricLine[]
+}
+
+model LyricLine {
+  id        String   @id @default(cuid())
+  songId    String
+  song      Song     @relation(fields: [songId], references: [id], onDelete: Cascade)
+  lineIndex Int
+  startTime Float?
+  endTime   Float?
+  japanese  String
+  tokens    String?  // JSON: Token[]
+  analysis  String?  // JSON: AnalysisResult
+  createdAt DateTime @default(now())
+
+  @@index([songId, lineIndex])
+}
