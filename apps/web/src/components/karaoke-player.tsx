@@ -1,59 +1,54 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import { Play, Pause, Loader2, CheckCircle2, XCircle, Zap } from "lucide-react";
+import {
+  Play, Pause, Loader2, CheckCircle2, XCircle, Zap,
+  ChevronDown, ChevronUp, Terminal,
+} from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
-import type { Job, JobStepInfo, JobStatus, LyricLine } from "@japanese-lyrics/shared";
+import type { Job, JobLogEntry, JobStepInfo, JobStatus, LyricLine } from "@japanese-lyrics/shared";
 
 // ── Types ──────────────────────────────────────────────────────────────────────
 
 interface KaraokePlayerProps {
-  songId: string;
-  youtubeId: string;
-  title: string | null;
-  artist: string | null;
-  initialJobId: string | null;
+  songId:        string;
+  youtubeId:     string;
+  title:         string | null;
+  artist:        string | null;
+  initialJobId:  string | null;
   initialStatus: string | null;
   initialLyrics: LyricLine[];
 }
 
 const STEP_LABELS: Record<string, string> = {
-  download:   "Downloading audio",
-  separate:   "Separating vocals",
-  transcribe: "Transcribing speech",
-  align:      "Aligning timestamps",
-  done:       "Complete",
+  download:   "Download audio",
+  separate:   "Separate vocals",
+  transcribe: "Transcribe speech",
+  align:      "Align timestamps",
 };
 
-const POLL_INTERVAL_MS = 2500;
+const POLL_MS = 2500;
 
-// ── Step progress indicator ────────────────────────────────────────────────────
+// ── Step row ───────────────────────────────────────────────────────────────────
 
 function StepRow({ step }: { step: JobStepInfo }) {
   const icon =
-    step.status === "completed" ? (
-      <CheckCircle2 className="h-4 w-4 text-green-500" />
-    ) : step.status === "processing" ? (
-      <Loader2 className="h-4 w-4 animate-spin text-primary" />
-    ) : step.status === "failed" ? (
-      <XCircle className="h-4 w-4 text-destructive" />
-    ) : (
-      <div className="h-4 w-4 rounded-full border border-muted-foreground/30" />
-    );
+    step.status === "completed"  ? <CheckCircle2 className="h-4 w-4 shrink-0 text-green-500" /> :
+    step.status === "processing" ? <Loader2       className="h-4 w-4 shrink-0 animate-spin text-primary" /> :
+    step.status === "failed"     ? <XCircle       className="h-4 w-4 shrink-0 text-destructive" /> :
+                                   <div className="h-4 w-4 shrink-0 rounded-full border border-muted-foreground/30" />;
 
   return (
-    <div className="flex items-center gap-3">
-      {icon}
-      <div className="flex-1">
+    <div className="flex items-start gap-3">
+      <div className="mt-0.5">{icon}</div>
+      <div className="flex-1 space-y-1">
         <div className="flex items-center justify-between text-sm">
           <span
             className={
-              step.status === "processing"
-                ? "text-foreground font-medium"
-                : step.status === "completed"
-                ? "text-muted-foreground"
-                : "text-muted-foreground/50"
+              step.status === "processing" ? "font-medium text-foreground" :
+              step.status === "completed"  ? "text-muted-foreground" :
+              "text-muted-foreground/50"
             }
           >
             {step.label}
@@ -61,16 +56,75 @@ function StepRow({ step }: { step: JobStepInfo }) {
           {step.status === "processing" && (
             <span className="text-xs text-muted-foreground">{step.progress}%</span>
           )}
+          {step.status === "completed" && (
+            <span className="text-xs text-green-600">done</span>
+          )}
         </div>
         {step.status === "processing" && (
-          <div className="mt-1 h-1 w-full overflow-hidden rounded-full bg-muted">
+          <div className="h-1 w-full overflow-hidden rounded-full bg-muted">
             <div
               className="h-full rounded-full bg-primary transition-all duration-500"
               style={{ width: `${step.progress}%` }}
             />
           </div>
         )}
+        {step.error && (
+          <p className="text-xs text-destructive">{step.error}</p>
+        )}
       </div>
+    </div>
+  );
+}
+
+// ── Log panel ──────────────────────────────────────────────────────────────────
+
+function LogPanel({ logs }: { logs: JobLogEntry[] }) {
+  const [open, setOpen] = useState(false);
+  const bottomRef       = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (open) bottomRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [logs, open]);
+
+  if (logs.length === 0) return null;
+
+  return (
+    <div className="rounded-lg border border-border bg-muted/30">
+      <button
+        onClick={() => setOpen((o) => !o)}
+        className="flex w-full items-center justify-between px-4 py-2 text-xs text-muted-foreground hover:text-foreground"
+      >
+        <span className="flex items-center gap-1.5">
+          <Terminal className="h-3.5 w-3.5" />
+          Processing log ({logs.length} entries)
+        </span>
+        {open ? <ChevronUp className="h-3.5 w-3.5" /> : <ChevronDown className="h-3.5 w-3.5" />}
+      </button>
+
+      {open && (
+        <div className="max-h-52 overflow-y-auto border-t border-border px-4 py-2 font-mono">
+          {logs.map((entry, i) => (
+            <div key={i} className="flex gap-2 py-0.5 text-xs">
+              <span className="shrink-0 text-muted-foreground/60">
+                {new Date(entry.ts).toLocaleTimeString()}
+              </span>
+              {entry.stage && (
+                <span className="shrink-0 text-primary/70">[{entry.stage}]</span>
+              )}
+              <span
+                className={
+                  entry.level === "error"   ? "text-destructive" :
+                  entry.level === "warning" ? "text-yellow-500"  :
+                  "text-foreground/80"
+                }
+              >
+                {entry.message}
+              </span>
+            </div>
+          ))}
+          <div ref={bottomRef} />
+        </div>
+      )}
     </div>
   );
 }
@@ -86,65 +140,50 @@ export function KaraokePlayer({
   initialStatus,
   initialLyrics,
 }: KaraokePlayerProps) {
-  const [jobId, setJobId]         = useState<string | null>(initialJobId);
-  const [jobStatus, setJobStatus] = useState<JobStatus | null>(
-    initialStatus as JobStatus | null
-  );
-  const [job, setJob]             = useState<Job | null>(null);
-  const [lyrics, setLyrics]       = useState<LyricLine[]>(initialLyrics);
-  const [isPlaying, setIsPlaying] = useState(false);
-  const [currentTime]             = useState(0);
+  const [jobId, setJobId]           = useState<string | null>(initialJobId);
+  const [jobStatus, setJobStatus]   = useState<JobStatus | null>(initialStatus as JobStatus | null);
+  const [job, setJob]               = useState<Job | null>(null);
+  const [lyrics, setLyrics]         = useState<LyricLine[]>(initialLyrics);
+  const [isPlaying, setIsPlaying]   = useState(false);
+  const [currentTime]               = useState(0);
   const [submitError, setSubmitError] = useState<string | null>(null);
-
-  const pollRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const pollRef                     = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // ── Polling ──────────────────────────────────────────────────────────────────
 
   const poll = useCallback(async (id: string) => {
     try {
-      const res = await fetch(`/api/jobs/${id}`);
+      const res  = await fetch(`/api/jobs/${id}`);
       if (!res.ok) return;
       const data = (await res.json()) as Job;
       setJob(data);
       setJobStatus(data.status);
 
       if (data.status === "completed") {
-        // Reload lyrics from DB (the GET /api/jobs/[id] route stores them)
-        const songRes = await fetch(`/api/songs/${songId}/lyrics`);
-        if (songRes.ok) {
-          const loaded = (await songRes.json()) as LyricLine[];
-          setLyrics(loaded);
-        }
+        const lr = await fetch(`/api/songs/${songId}/lyrics`);
+        if (lr.ok) setLyrics((await lr.json()) as LyricLine[]);
       } else if (data.status === "processing" || data.status === "queued") {
-        pollRef.current = setTimeout(() => poll(id), POLL_INTERVAL_MS);
+        pollRef.current = setTimeout(() => poll(id), POLL_MS);
       }
     } catch {
-      // retry on next interval
-      pollRef.current = setTimeout(() => poll(id), POLL_INTERVAL_MS);
+      pollRef.current = setTimeout(() => poll(id), POLL_MS);
     }
   }, [songId]);
 
   useEffect(() => {
-    if (
-      jobId &&
-      (jobStatus === "processing" || jobStatus === "queued")
-    ) {
-      poll(jobId);
-    }
-    return () => {
-      if (pollRef.current) clearTimeout(pollRef.current);
-    };
+    if (jobId && (jobStatus === "processing" || jobStatus === "queued")) poll(jobId);
+    return () => { if (pollRef.current) clearTimeout(pollRef.current); };
   }, [jobId, jobStatus, poll]);
 
-  // ── Submit job ───────────────────────────────────────────────────────────────
+  // ── Submit ────────────────────────────────────────────────────────────────────
 
   async function submitJob() {
     setSubmitError(null);
     try {
-      const res = await fetch("/api/jobs", {
-        method: "POST",
+      const res  = await fetch("/api/jobs", {
+        method:  "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ songId }),
+        body:    JSON.stringify({ songId }),
       });
       const data = (await res.json()) as { jobId?: string; status?: string; error?: string };
       if (!res.ok) throw new Error(data.error ?? "Failed to start job");
@@ -155,24 +194,23 @@ export function KaraokePlayer({
     }
   }
 
-  // ── Active lyric line ─────────────────────────────────────────────────────────
+  // ── Helpers ───────────────────────────────────────────────────────────────────
 
-  const activeLine = lyrics.find(
-    (l) =>
-      l.startTime !== null &&
-      l.endTime !== null &&
-      currentTime >= l.startTime &&
-      currentTime <= l.endTime
+  const activeLine  = lyrics.find(
+    (l) => l.startTime !== null && l.endTime !== null &&
+           currentTime >= l.startTime && currentTime <= l.endTime
   );
+  const isActive    = jobStatus === "queued" || jobStatus === "processing";
+  const isDone      = jobStatus === "completed";
+  const hasFailed   = jobStatus === "failed";
+  const overallPct  = job?.progress ?? 0;
+  const logs        = job?.recentLogs ?? [];
 
   // ── Render ────────────────────────────────────────────────────────────────────
 
-  const isActive = jobStatus === "queued" || jobStatus === "processing";
-  const hasFailed = jobStatus === "failed";
-  const isDone = jobStatus === "completed";
-
   return (
     <div className="flex flex-col gap-6">
+
       {/* YouTube embed */}
       <div className="relative aspect-video w-full overflow-hidden rounded-xl bg-muted">
         <iframe
@@ -196,10 +234,28 @@ export function KaraokePlayer({
           <CardHeader className="pb-3">
             <CardTitle className="flex items-center gap-2 text-base">
               <Zap className="h-4 w-4 text-primary" />
-              {isActive ? "Processing…" : "Process Lyrics"}
+              {isActive ? (
+                <span className="flex items-center gap-2">
+                  Processing…
+                  <span className="text-sm font-normal text-muted-foreground">
+                    {overallPct}%
+                  </span>
+                </span>
+              ) : "Process Lyrics"}
             </CardTitle>
           </CardHeader>
           <CardContent className="space-y-4">
+
+            {/* Overall progress bar */}
+            {isActive && (
+              <div className="h-1.5 w-full overflow-hidden rounded-full bg-muted">
+                <div
+                  className="h-full rounded-full bg-primary transition-all duration-700"
+                  style={{ width: `${overallPct}%` }}
+                />
+              </div>
+            )}
+
             {isActive && job ? (
               <>
                 <div className="space-y-3">
@@ -207,16 +263,14 @@ export function KaraokePlayer({
                     <StepRow key={step.name} step={step} />
                   ))}
                 </div>
-                <div className="flex items-center gap-2 text-sm text-muted-foreground">
-                  <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                  Overall: {job.progress}%
-                </div>
+                <LogPanel logs={logs} />
               </>
             ) : hasFailed ? (
               <div className="space-y-3">
                 <p className="text-sm text-destructive">
-                  Processing failed: {job?.error ?? "unknown error"}
+                  {job?.error ?? "Processing failed — unknown error"}
                 </p>
+                <LogPanel logs={logs} />
                 <Button onClick={submitJob} variant="outline" size="sm">
                   Retry
                 </Button>
@@ -224,8 +278,8 @@ export function KaraokePlayer({
             ) : (
               <div className="space-y-3">
                 <p className="text-sm text-muted-foreground">
-                  Extract lyrics from this video using local Whisper + WhisperX forced alignment.
-                  No paid APIs — runs entirely on your machine.
+                  Extract lyrics using local Whisper + WhisperX forced alignment.
+                  Audio is cached — re-submitting the same video is instant.
                 </p>
                 {submitError && (
                   <p className="text-sm text-destructive">{submitError}</p>
@@ -252,11 +306,7 @@ export function KaraokePlayer({
                 onClick={() => setIsPlaying((p) => !p)}
                 className="gap-1.5"
               >
-                {isPlaying ? (
-                  <Pause className="h-4 w-4" />
-                ) : (
-                  <Play className="h-4 w-4" />
-                )}
+                {isPlaying ? <Pause className="h-4 w-4" /> : <Play className="h-4 w-4" />}
                 {isPlaying ? "Pause" : "Play"}
               </Button>
             </CardTitle>

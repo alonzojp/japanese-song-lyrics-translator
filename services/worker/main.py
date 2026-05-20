@@ -1,6 +1,5 @@
 """
 Japanese Lyrics Worker — FastAPI service.
-Handles job creation, status polling, and result retrieval.
 Heavy processing runs in a thread pool (one job at a time by default).
 """
 from __future__ import annotations
@@ -9,13 +8,16 @@ import json
 import logging
 import os
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import BackgroundTasks, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
-from config import CACHE_DIR, WHISPER_MODEL, WORKER_CONCURRENCY
+from cache import cleanup_old, list_cached
+from config import CACHE_MAX_AGE_DAYS, WHISPER_MODEL, WORKER_CONCURRENCY
+from logs import get_recent_logs
 from models import CreateJobRequest, JobStatus, WorkerHealth
 from pipeline import run_job
 from queue import create_job, get_job, get_queue_depth, get_result_path
@@ -26,13 +28,24 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Single global executor limits concurrent heavy jobs
 _executor = ThreadPoolExecutor(max_workers=WORKER_CONCURRENCY)
+
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    # Startup: evict stale cache entries
+    deleted = cleanup_old(max_age_days=CACHE_MAX_AGE_DAYS)
+    if deleted:
+        logger.info("Startup cache cleanup: removed %d stale entries", len(deleted))
+    yield
+    _executor.shutdown(wait=False)
+
 
 app = FastAPI(
     title="Japanese Lyrics Worker",
     version="0.1.0",
     description="Audio processing pipeline for Japanese song lyrics",
+    lifespan=lifespan,
 )
 
 app.add_middleware(
@@ -61,6 +74,26 @@ async def health() -> dict:
     ).model_dump(by_alias=True)
 
 
+# ── Cache info ─────────────────────────────────────────────────────────────────
+
+@app.get("/cache")
+async def cache_info() -> list[dict]:
+    """List all cached videos with processing state."""
+    return list_cached()
+
+
+@app.delete("/cache/{youtube_id}")
+async def evict_cache(youtube_id: str) -> dict:
+    """Force-evict a single video from cache."""
+    import shutil
+    from config import CACHE_DIR
+    target = CACHE_DIR / youtube_id
+    if not target.exists():
+        raise HTTPException(status_code=404, detail="Not in cache")
+    shutil.rmtree(target)
+    return {"evicted": youtube_id}
+
+
 # ── Jobs ───────────────────────────────────────────────────────────────────────
 
 @app.post("/jobs", status_code=201)
@@ -73,10 +106,8 @@ async def create_job_endpoint(
         youtube_id=body.youtube_id,
         youtube_url=body.youtube_url,
     )
-    # Dispatch to thread pool (non-blocking)
     background_tasks.add_task(_run_in_executor, job.id)
     logger.info("Job %s created for %s", job.id, body.youtube_id)
-
     return JSONResponse(
         content={"jobId": job.id, "status": job.status.value},
         status_code=201,
@@ -92,7 +123,8 @@ async def get_job_endpoint(job_id: str) -> dict:
     job = get_job(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
-    return job.to_api()
+    logs = get_recent_logs(job_id, limit=40)
+    return job.to_api(logs=logs)
 
 
 @app.get("/jobs/{job_id}/result")
@@ -105,7 +137,6 @@ async def get_result_endpoint(job_id: str) -> dict:
             status_code=409,
             detail=f"Job is {job.status.value}, not completed",
         )
-
     result_path = get_result_path(job_id)
     if not result_path or not Path(result_path).exists():
         raise HTTPException(status_code=404, detail="Result file not found")

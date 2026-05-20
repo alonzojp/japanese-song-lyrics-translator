@@ -43,12 +43,13 @@ class Job(BaseModel):
     current_step: Optional[PipelineStep] = None
     steps:        list[JobStepInfo]
     error:        Optional[str] = None
+    recent_logs:  list["LogEntry"] = Field(default_factory=list)
     created_at:   datetime
     updated_at:   datetime
 
     model_config = {"populate_by_name": True}
 
-    def to_api(self) -> dict:
+    def to_api(self, logs: list[dict] | None = None) -> dict:
         """Serialize to camelCase for the REST API (matches TypeScript contract)."""
         return {
             "id":          self.id,
@@ -68,9 +69,10 @@ class Job(BaseModel):
                 }
                 for s in self.steps
             ],
-            "error":     self.error,
-            "createdAt": self.created_at.isoformat(),
-            "updatedAt": self.updated_at.isoformat(),
+            "error":      self.error,
+            "recentLogs": logs or [],
+            "createdAt":  self.created_at.isoformat(),
+            "updatedAt":  self.updated_at.isoformat(),
         }
 
 
@@ -129,6 +131,15 @@ class JobResult(BaseModel):
     metadata:   ResultMetadata
 
     model_config = {"populate_by_name": True}
+
+
+# ── Log entry ─────────────────────────────────────────────────────────────────
+
+class LogEntry(BaseModel):
+    ts:      str
+    level:   Literal["info", "warning", "error"]
+    stage:   Optional[str] = None
+    message: str
 
 
 # ── Health ─────────────────────────────────────────────────────────────────────

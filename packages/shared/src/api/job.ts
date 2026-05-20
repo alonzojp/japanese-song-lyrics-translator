@@ -19,6 +19,13 @@ export interface JobStepInfo {
   error: string | null;
 }
 
+export interface JobLogEntry {
+  ts: string;
+  level: "info" | "warning" | "error";
+  stage: PipelineStep | null;
+  message: string;
+}
+
 export interface Job {
   id: string;
   songId: string;
@@ -30,6 +37,7 @@ export interface Job {
   currentStep: PipelineStep | null;
   steps: JobStepInfo[];
   error: string | null;
+  recentLogs: JobLogEntry[];
   createdAt: string;
   updatedAt: string;
 }
