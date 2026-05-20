@@ -196,9 +196,8 @@ export function KaraokePlayer({
 
   // ── Helpers ───────────────────────────────────────────────────────────────────
 
-  const activeLine  = lyrics.find(
-    (l) => l.startTime !== null && l.endTime !== null &&
-           currentTime >= l.startTime && currentTime <= l.endTime
+  const activeLine = lyrics.find(
+    (l) => currentTime >= l.startTime && currentTime <= l.endTime
   );
   const isActive    = jobStatus === "queued" || jobStatus === "processing";
   const isDone      = jobStatus === "completed";
@@ -315,22 +314,16 @@ export function KaraokePlayer({
             <div className="space-y-1">
               {lyrics.map((line) => (
                 <div
-                  key={line.index}
+                  key={line.id}
                   className={`rounded-lg px-4 py-3 transition-all duration-300 ${
-                    activeLine?.index === line.index
+                    activeLine?.id === line.id
                       ? "animate-karaoke-highlight bg-primary/10 text-primary"
                       : "text-foreground/70 hover:bg-muted"
                   }`}
                 >
-                  <p
-                    className="font-japanese text-lg leading-loose"
-                    dangerouslySetInnerHTML={{ __html: line.japanese }}
-                  />
-                  {line.analysis?.translation.natural && (
-                    <p className="mt-1 text-sm text-muted-foreground">
-                      {line.analysis.translation.natural}
-                    </p>
-                  )}
+                  <p className="font-japanese text-lg leading-loose">
+                    {line.text}
+                  </p>
                 </div>
               ))}
             </div>

@@ -4,7 +4,7 @@ import { ArrowLeft } from "lucide-react";
 import Link from "next/link";
 import { KaraokePlayer } from "@/components/karaoke-player";
 import { prisma } from "@/lib/prisma";
-import type { AnalysisResult, LyricLine, Token } from "@japanese-lyrics/shared";
+import type { LyricLine, WordTiming } from "@japanese-lyrics/shared";
 
 interface PlayerPageProps {
   params: { id: string };
@@ -18,12 +18,11 @@ async function getSong(id: string) {
   if (!song) return null;
 
   const lyrics: LyricLine[] = song.lyrics.map((line) => ({
-    index:     line.lineIndex,
-    startTime: line.startTime,
-    endTime:   line.endTime,
-    japanese:  line.japanese,
-    tokens:    line.tokens   ? (JSON.parse(line.tokens)   as Token[])         : null,
-    analysis:  line.analysis ? (JSON.parse(line.analysis) as AnalysisResult)  : null,
+    id:        `line-${line.lineIndex}`,
+    text:      line.japanese,
+    startTime: line.startTime ?? 0,
+    endTime:   line.endTime   ?? 0,
+    words:     line.words ? (JSON.parse(line.words) as WordTiming[]) : undefined,
   }));
 
   return {

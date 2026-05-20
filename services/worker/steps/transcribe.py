@@ -1,139 +1,127 @@
 """
-Step 3 — Transcription + forced alignment via WhisperX.
-Input:  vocals.wav (or full audio)
-Output: list of segments with word-level timestamps
+Step 3 — Transcription + forced alignment.
 
-Cache behaviour: skips if manifest marks transcribe as complete
-and the raw transcript JSON file exists.
+Sub-steps (all cached independently):
+  3a. audio_prep   → vocals_asr.wav          (ffmpeg: 16kHz mono, filtered)
+  3b. transcribe   → transcript.json         (Whisper ASR via best backend)
+  3c. force_align  → aligned_words.json      (WhisperX / aeneas / even)
+
+Cache behaviour:
+  - Each sub-step checks for its output file; re-runs only missing stages.
+  - Full cache hit → skips all sub-steps, loads and returns stored segments.
 """
 from __future__ import annotations
 
-import json
 import logging
 from pathlib import Path
 from typing import Callable, Optional
 
-from cache import is_stage_complete, mark_stage_complete
-from config import (
-    WHISPER_BATCH_SIZE,
-    WHISPER_COMPUTE_TYPE,
-    WHISPER_DEVICE,
-    WHISPER_LANGUAGE,
-    WHISPER_MODEL,
+import soundfile as sf
+
+from alignment import (
+    force_align,
+    load_aligned_words,
+    load_transcript,
+    prepare_audio_for_asr,
+    save_aligned_words,
+    save_transcript,
+    transcribe,
 )
+from cache import is_stage_complete, mark_stage_complete
 
 logger = logging.getLogger(__name__)
 
 ProgressCallback = Optional[Callable[[int], None]]
-TRANSCRIPT_FILE  = "transcript_raw.json"
 
 
-def _resolve_device() -> tuple[str, str]:
-    try:
-        import torch
-        has_cuda = torch.cuda.is_available()
-    except ImportError:
-        has_cuda = False
-
-    device       = ("cuda" if has_cuda else "cpu") if WHISPER_DEVICE == "auto" else WHISPER_DEVICE
-    compute_type = ("float16" if device == "cuda" else "int8") if WHISPER_COMPUTE_TYPE == "auto" else WHISPER_COMPUTE_TYPE
-    return device, compute_type
-
-
-def transcribe_and_align(
+def run_transcription(
     audio_path:  Path,
     output_dir:  Path,
     youtube_id:  str,
     progress_cb: ProgressCallback = None,
     job_log=None,
-) -> list[dict]:
+) -> tuple[list[dict], str, str]:
     """
-    Run WhisperX transcription + forced alignment.
-    Returns list of aligned segment dicts:
-      {start, end, text, words: [{word, start, end, score}]}
-    """
-    import whisperx  # lazy — heavy import
+    Full transcription + forced alignment for one audio file.
 
+    Returns (enriched_segments, transcription_backend, alignment_method).
+
+    Progress: 0 → 100 across all three sub-steps.
+    """
     def log(msg: str) -> None:
         if job_log:
             job_log.info(msg, stage="transcribe")
         logger.info(msg)
 
-    transcript_path = output_dir / TRANSCRIPT_FILE
+    def sub_cb(fraction_of_total: float) -> Callable[[int], None]:
+        """Wrap a sub-step progress into an overall range."""
+        def _cb(pct: int) -> None:
+            if progress_cb:
+                progress_cb(int(fraction_of_total * pct))
+        return _cb
 
-    # ── Cache hit ──────────────────────────────────────────────────────────────
-    if is_stage_complete(youtube_id, "transcribe") and transcript_path.exists():
-        log(f"Cache hit — loading saved transcript for {youtube_id}")
-        segments = json.loads(transcript_path.read_text(encoding="utf-8"))
-        if progress_cb:
-            progress_cb(100)
-        return segments
+    # ── Full cache hit ─────────────────────────────────────────────────────────
+    if is_stage_complete(youtube_id, "transcribe"):
+        loaded = load_aligned_words(output_dir)
+        if loaded:
+            segs, method = loaded
+            log(f"Cache hit — loaded {len(segs)} aligned segments for {youtube_id}")
+            if progress_cb:
+                progress_cb(100)
+            return segs, "cached", method
 
-    device, compute_type = _resolve_device()
-    log(
-        f"Loading Whisper model={WHISPER_MODEL} device={device} "
-        f"compute={compute_type} …"
+    # ── 3a: Audio prep (0–20 %) ────────────────────────────────────────────────
+    log("Preparing audio for ASR …")
+    asr_path = prepare_audio_for_asr(
+        audio_path,
+        output_dir,
+        progress_cb=sub_cb(0.20),
+        job_log=job_log,
     )
-    if progress_cb:
-        progress_cb(5)
 
-    model = whisperx.load_model(
-        WHISPER_MODEL,
-        device,
-        compute_type=compute_type,
-        language=WHISPER_LANGUAGE,
-    )
-    if progress_cb:
-        progress_cb(20)
+    # ── 3b: Transcription (20–70 %) ────────────────────────────────────────────
+    raw_segments = load_transcript(output_dir)
+    if raw_segments is not None:
+        log(f"Loaded cached transcript ({len(raw_segments)} segments)")
+        backend = "cached"
+    else:
+        log("Transcribing …")
 
-    log(f"Transcribing {audio_path.name} (batch_size={WHISPER_BATCH_SIZE}) …")
-    audio  = whisperx.load_audio(str(audio_path))
-    result = model.transcribe(
-        audio,
-        language=WHISPER_LANGUAGE,
-        batch_size=WHISPER_BATCH_SIZE,
-    )
-    seg_count = len(result.get("segments", []))
-    log(f"Transcription complete: {seg_count} raw segments")
-    if progress_cb:
-        progress_cb(60)
+        def tx_cb(pct: int) -> None:
+            if progress_cb:
+                progress_cb(20 + int(0.50 * pct))
 
-    # Free VRAM before alignment pass
-    del model
-    try:
-        import gc, torch
-        gc.collect(); torch.cuda.empty_cache()
-    except Exception:
-        pass
+        raw_segments, backend = transcribe(asr_path, progress_cb=tx_cb, job_log=job_log)
+        log(f"Transcription complete: {len(raw_segments)} segments via {backend}")
+        save_transcript(output_dir, raw_segments, backend)
 
-    log("Running forced alignment …")
-    align_model, align_meta = whisperx.load_align_model(
-        language_code=WHISPER_LANGUAGE,
-        device=device,
-    )
-    aligned = whisperx.align(
-        result["segments"],
-        align_model,
-        align_meta,
-        audio,
-        device,
-        return_char_alignments=False,
-    )
-    segments: list[dict] = aligned.get("segments", [])
-    log(f"Alignment complete: {len(segments)} segments with word timestamps")
-    if progress_cb:
-        progress_cb(95)
+    # ── 3c: Forced alignment (70–100 %) ────────────────────────────────────────
+    loaded_aligned = load_aligned_words(output_dir)
+    if loaded_aligned:
+        aligned_segs, method = loaded_aligned
+        log(f"Loaded cached alignment ({method})")
+    else:
+        log("Running forced alignment …")
 
-    # Persist raw transcript for cache
-    transcript_path.write_text(
-        json.dumps(segments, ensure_ascii=False),
-        encoding="utf-8",
-    )
+        def al_cb(pct: int) -> None:
+            if progress_cb:
+                progress_cb(70 + int(0.30 * pct))
+
+        aligned_segs, method = force_align(
+            raw_segments, asr_path, progress_cb=al_cb, job_log=job_log
+        )
+        log(f"Alignment complete via {method}: {len(aligned_segs)} segments")
+        save_aligned_words(output_dir, aligned_segs, method)
+
+    # ── Update manifest ────────────────────────────────────────────────────────
     mark_stage_complete(youtube_id, "transcribe", {
-        "transcriptPath": TRANSCRIPT_FILE,
-        "segmentCount":   len(segments),
+        "transcriptPath":    "transcript.json",
+        "alignedWordsPath":  "aligned_words.json",
+        "segmentCount":      len(aligned_segs),
+        "backend":           backend,
+        "alignmentMethod":   method,
     })
 
     if progress_cb:
         progress_cb(100)
-    return segments
+    return aligned_segs, backend, method

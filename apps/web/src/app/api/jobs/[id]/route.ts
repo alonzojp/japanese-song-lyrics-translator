@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { workerClient } from "@/lib/worker-client";
+import type { WordTiming } from "@japanese-lyrics/shared";
 
 interface RouteParams {
   params: { id: string };
@@ -24,32 +25,52 @@ export async function GET(_req: Request, { params }: RouteParams) {
   await prisma.song
     .updateMany({
       where: { currentJobId: jobId },
-      data: { processingStatus: job.status },
+      data:  { processingStatus: job.status },
     })
     .catch(() => {});
 
-  // When completed, store lyrics in DB
+  // When completed, persist lyrics + word timings to DB
   if (job.status === "completed") {
     try {
       const result = await workerClient.getResult(jobId);
-      const song = await prisma.song.findFirst({ where: { currentJobId: jobId } });
+      const song   = await prisma.song.findFirst({ where: { currentJobId: jobId } });
 
-      if (song && result.lyrics.length > 0) {
-        // Delete old lines then bulk-insert new ones
-        await prisma.lyricLine.deleteMany({ where: { songId: song.id } });
-        await prisma.lyricLine.createMany({
-          data: result.lyrics.map((line) => ({
-            songId: song.id,
-            lineIndex: line.index,
-            startTime: line.startTime,
-            endTime: line.endTime,
-            japanese: line.text,
-            words: JSON.stringify(line.words),
-          })),
-        });
+      if (song) {
+        // Prefer aligned_lines (LyricLine format with word timings) over legacy lyrics
+        const alignedLines = (result as unknown as Record<string, unknown>).alignedLines as
+          Array<{
+            id: string;
+            text: string;
+            startTime: number;
+            endTime: number;
+            words?: WordTiming[];
+            confidence?: number;
+          }> | undefined;
+
+        const lines = alignedLines ?? result.lyrics.map((l, i) => ({
+          id:        `line-${i}`,
+          text:      l.text,
+          startTime: l.startTime,
+          endTime:   l.endTime,
+          words:     l.words?.map((w) => ({ word: w.word, start: w.startTime, end: w.endTime })),
+        }));
+
+        if (lines.length > 0) {
+          await prisma.lyricLine.deleteMany({ where: { songId: song.id } });
+          await prisma.lyricLine.createMany({
+            data: lines.map((line, i) => ({
+              songId:    song.id,
+              lineIndex: i,
+              startTime: line.startTime,
+              endTime:   line.endTime,
+              japanese:  line.text,
+              words:     line.words ? JSON.stringify(line.words) : null,
+            })),
+          });
+        }
       }
     } catch {
-      // Non-fatal — lyrics will be fetched on next poll
+      // Non-fatal — retry on next poll
     }
   }
 

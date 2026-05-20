@@ -149,6 +149,18 @@ async def get_result_endpoint(job_id: str) -> dict:
     data = json.loads(Path(result_path).read_text(encoding="utf-8"))
     data["jobId"]  = job_id
     data["songId"] = job.song_id
+
+    # Enrich with alignment metadata + aligned lines if available
+    result_dir = Path(result_path).parent
+    for extra_file, key in [
+        ("aligned_lines.json",  "alignedLines"),
+        ("alignment_meta.json", "alignmentMeta"),
+    ]:
+        extra_path = result_dir / extra_file
+        if extra_path.exists():
+            extra = json.loads(extra_path.read_text(encoding="utf-8"))
+            data[key] = extra.get("lines", extra) if key == "alignedLines" else extra
+
     return data
 
 
