@@ -7,6 +7,13 @@ const nextConfig = {
     "@japanese-lyrics/anki",
     "@japanese-lyrics/alignment",
   ],
+  webpack: (config) => {
+    config.resolve.extensionAlias = {
+      ".js":  [".ts", ".tsx", ".js", ".jsx"],
+      ".mjs": [".mts", ".mjs"],
+    };
+    return config;
+  },
   images: {
     remotePatterns: [
       {
