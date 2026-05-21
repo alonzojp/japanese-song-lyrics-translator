@@ -44,3 +44,6 @@ export {
 // ── Main exporter ─────────────────────────────────────────────────────────────
 export { AnkiExporter, createExporter } from "./exporter.js";
 export type { ExporterOptions } from "./exporter.js";
+
+// ── JSON export ───────────────────────────────────────────────────────────────
+export { exportToJson } from "./json.js";

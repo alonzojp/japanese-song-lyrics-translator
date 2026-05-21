@@ -17,6 +17,10 @@ export interface LyricLine {
   words?:     WordTiming[];
   /** 0.0–1.0 alignment confidence for this specific line */
   confidence?: number;
+  /** Morphological tokens — populated after NLP analysis (POST /api/songs/:id/analyze). */
+  tokens?:    Token[];
+  /** Full-line furigana HTML — populated after NLP analysis. */
+  furigana?:  string;
 }
 
 // ── Alignment metadata ────────────────────────────────────────────────────────

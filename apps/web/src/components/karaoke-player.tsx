@@ -3,11 +3,14 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
   Play, Pause, Loader2, CheckCircle2, XCircle, Zap,
-  ChevronDown, ChevronUp, Terminal,
+  ChevronDown, ChevronUp, Terminal, BookOpen, MousePointer2,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
-import type { Job, JobLogEntry, JobStepInfo, JobStatus, LyricLine } from "@japanese-lyrics/shared";
+import { AnkiExportDialog } from "@/components/anki-export-dialog";
+import { VocabCard, makeWordCard } from "@/components/vocab-card";
+import type { Job, JobLogEntry, JobStepInfo, JobStatus, LyricLine, Token } from "@japanese-lyrics/shared";
+import type { ExportCard } from "@japanese-lyrics/anki";
 
 // ── Types ──────────────────────────────────────────────────────────────────────
 
@@ -19,6 +22,19 @@ interface KaraokePlayerProps {
   initialJobId:  string | null;
   initialStatus: string | null;
   initialLyrics: LyricLine[];
+}
+
+interface VocabState {
+  token:      Token;
+  tokenIndex: number;
+  line:       LyricLine;
+}
+
+interface SelectedItem {
+  token:    Token;
+  lineText: string;
+  startTime: number;
+  key:      string;   // `${line.id}-${tokenIndex}`
 }
 
 const STEP_LABELS: Record<string, string> = {
@@ -51,7 +67,7 @@ function StepRow({ step }: { step: JobStepInfo }) {
               "text-muted-foreground/50"
             }
           >
-            {step.label}
+            {STEP_LABELS[step.name] ?? step.label}
           </span>
           {step.status === "processing" && (
             <span className="text-xs text-muted-foreground">{step.progress}%</span>
@@ -129,6 +145,41 @@ function LogPanel({ logs }: { logs: JobLogEntry[] }) {
   );
 }
 
+// ── Token span ─────────────────────────────────────────────────────────────────
+
+function TokenSpan({
+  token,
+  isSelected,
+  isHighlighted,
+  onClick,
+}: {
+  token:        Token;
+  isSelected:   boolean;
+  isHighlighted: boolean;
+  onClick:      () => void;
+}) {
+  const base =
+    "cursor-pointer rounded px-[1px] transition-colors select-none " +
+    "hover:bg-primary/15 active:bg-primary/25 " +
+    (isSelected   ? "bg-primary/20 text-primary ring-1 ring-primary/40 " : "") +
+    (isHighlighted ? "text-primary " : "");
+
+  return (
+    <span className={base} onClick={onClick}>
+      {token.furigana ? (
+        <ruby>
+          {token.surface}
+          <rt className="text-[0.45em] font-normal text-muted-foreground">
+            {token.reading}
+          </rt>
+        </ruby>
+      ) : (
+        token.surface
+      )}
+    </span>
+  );
+}
+
 // ── Main component ─────────────────────────────────────────────────────────────
 
 export function KaraokePlayer({
@@ -140,6 +191,7 @@ export function KaraokePlayer({
   initialStatus,
   initialLyrics,
 }: KaraokePlayerProps) {
+  // ── Job / lyrics state ────────────────────────────────────────────────────────
   const [jobId, setJobId]           = useState<string | null>(initialJobId);
   const [jobStatus, setJobStatus]   = useState<JobStatus | null>(initialStatus as JobStatus | null);
   const [job, setJob]               = useState<Job | null>(null);
@@ -149,7 +201,32 @@ export function KaraokePlayer({
   const [submitError, setSubmitError] = useState<string | null>(null);
   const pollRef                     = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  // ── Polling ──────────────────────────────────────────────────────────────────
+  // ── Vocab / selection state ───────────────────────────────────────────────────
+  const [vocabState, setVocabState]         = useState<VocabState | null>(null);
+  const [selectionMode, setSelectionMode]   = useState(false);
+  const [selectedItems, setSelectedItems]   = useState<SelectedItem[]>([]);
+  const [exportCards, setExportCards]       = useState<ExportCard[] | null>(null);
+  const [isAnalyzing, setIsAnalyzing]       = useState(false);
+  const [analyzeError, setAnalyzeError]     = useState<string | null>(null);
+
+  // ── Derived ───────────────────────────────────────────────────────────────────
+  const hasTokens   = lyrics.some((l) => l.tokens && l.tokens.length > 0);
+  const activeLine  = lyrics.find((l) => currentTime >= l.startTime && currentTime <= l.endTime);
+  const isActive    = jobStatus === "queued" || jobStatus === "processing";
+  const isDone      = jobStatus === "completed";
+  const hasFailed   = jobStatus === "failed";
+  const overallPct  = job?.progress ?? 0;
+  const logs        = job?.recentLogs ?? [];
+
+  // ── Job polling ───────────────────────────────────────────────────────────────
+
+  const reloadLyrics = useCallback(async () => {
+    const res = await fetch(`/api/songs/${songId}/lyrics`);
+    if (res.ok) {
+      const { lines } = (await res.json()) as { lines: LyricLine[] };
+      setLyrics(lines);
+    }
+  }, [songId]);
 
   const poll = useCallback(async (id: string) => {
     try {
@@ -160,22 +237,21 @@ export function KaraokePlayer({
       setJobStatus(data.status);
 
       if (data.status === "completed") {
-        const lr = await fetch(`/api/songs/${songId}/lyrics`);
-        if (lr.ok) setLyrics((await lr.json()) as LyricLine[]);
+        await reloadLyrics();
       } else if (data.status === "processing" || data.status === "queued") {
         pollRef.current = setTimeout(() => poll(id), POLL_MS);
       }
     } catch {
       pollRef.current = setTimeout(() => poll(id), POLL_MS);
     }
-  }, [songId]);
+  }, [reloadLyrics]);
 
   useEffect(() => {
     if (jobId && (jobStatus === "processing" || jobStatus === "queued")) poll(jobId);
     return () => { if (pollRef.current) clearTimeout(pollRef.current); };
   }, [jobId, jobStatus, poll]);
 
-  // ── Submit ────────────────────────────────────────────────────────────────────
+  // ── Submit processing job ─────────────────────────────────────────────────────
 
   async function submitJob() {
     setSubmitError(null);
@@ -194,16 +270,59 @@ export function KaraokePlayer({
     }
   }
 
-  // ── Helpers ───────────────────────────────────────────────────────────────────
+  // ── NLP analysis ─────────────────────────────────────────────────────────────
 
-  const activeLine = lyrics.find(
-    (l) => currentTime >= l.startTime && currentTime <= l.endTime
-  );
-  const isActive    = jobStatus === "queued" || jobStatus === "processing";
-  const isDone      = jobStatus === "completed";
-  const hasFailed   = jobStatus === "failed";
-  const overallPct  = job?.progress ?? 0;
-  const logs        = job?.recentLogs ?? [];
+  async function handleAnalyze() {
+    setIsAnalyzing(true);
+    setAnalyzeError(null);
+    try {
+      const res = await fetch(`/api/songs/${songId}/analyze`, { method: "POST" });
+      if (!res.ok) {
+        const { error } = (await res.json().catch(() => ({}))) as { error?: string };
+        throw new Error(error ?? "Analysis failed");
+      }
+      await reloadLyrics();
+    } catch (err) {
+      setAnalyzeError(err instanceof Error ? err.message : "Analysis failed");
+    } finally {
+      setIsAnalyzing(false);
+    }
+  }
+
+  // ── Token interaction ─────────────────────────────────────────────────────────
+
+  function handleTokenClick(token: Token, tokenIndex: number, line: LyricLine) {
+    if (selectionMode) {
+      const key = `${line.id}-${tokenIndex}`;
+      setSelectedItems((prev) => {
+        const exists = prev.findIndex((s) => s.key === key);
+        if (exists !== -1) return prev.filter((_, i) => i !== exists);
+        return [
+          ...prev,
+          { token, lineText: line.text, startTime: line.startTime, key },
+        ];
+      });
+    } else {
+      setVocabState({ token, tokenIndex, line });
+    }
+  }
+
+  function handleVocabExport(cards: ExportCard[]) {
+    setVocabState(null);
+    setExportCards(cards);
+  }
+
+  function clearSelection() {
+    setSelectionMode(false);
+    setSelectedItems([]);
+  }
+
+  function exportSelected() {
+    const cards = selectedItems.map(({ token, lineText, startTime }) =>
+      makeWordCard(token, lineText, title, startTime),
+    );
+    setExportCards(cards);
+  }
 
   // ── Render ────────────────────────────────────────────────────────────────────
 
@@ -244,8 +363,6 @@ export function KaraokePlayer({
             </CardTitle>
           </CardHeader>
           <CardContent className="space-y-4">
-
-            {/* Overall progress bar */}
             {isActive && (
               <div className="h-1.5 w-full overflow-hidden rounded-full bg-muted">
                 <div
@@ -299,17 +416,65 @@ export function KaraokePlayer({
           <CardHeader className="pb-3">
             <CardTitle className="flex items-center justify-between text-base">
               <span>Lyrics</span>
-              <Button
-                variant="ghost"
-                size="sm"
-                onClick={() => setIsPlaying((p) => !p)}
-                className="gap-1.5"
-              >
-                {isPlaying ? <Pause className="h-4 w-4" /> : <Play className="h-4 w-4" />}
-                {isPlaying ? "Pause" : "Play"}
-              </Button>
+
+              <div className="flex items-center gap-2">
+                {/* Play/pause toggle */}
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  onClick={() => setIsPlaying((p) => !p)}
+                  className="gap-1.5"
+                >
+                  {isPlaying ? <Pause className="h-4 w-4" /> : <Play className="h-4 w-4" />}
+                  {isPlaying ? "Pause" : "Play"}
+                </Button>
+
+                {/* Analyze vocabulary */}
+                {!hasTokens && (
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={handleAnalyze}
+                    disabled={isAnalyzing}
+                    className="gap-1.5"
+                  >
+                    {isAnalyzing
+                      ? <Loader2 className="h-4 w-4 animate-spin" />
+                      : <BookOpen className="h-4 w-4" />
+                    }
+                    {isAnalyzing ? "Analyzing…" : "Analyze vocabulary"}
+                  </Button>
+                )}
+
+                {/* Selection mode toggle */}
+                {hasTokens && (
+                  <Button
+                    variant={selectionMode ? "default" : "outline"}
+                    size="sm"
+                    onClick={() => {
+                      setSelectionMode((v) => !v);
+                      setSelectedItems([]);
+                    }}
+                    className="gap-1.5"
+                  >
+                    <MousePointer2 className="h-4 w-4" />
+                    {selectionMode ? "Done" : "Select"}
+                  </Button>
+                )}
+              </div>
             </CardTitle>
+
+            {analyzeError && (
+              <p className="mt-1 text-xs text-destructive">{analyzeError}</p>
+            )}
+
+            {selectionMode && (
+              <p className="mt-1 text-xs text-muted-foreground">
+                Click words to add them to your export queue.
+              </p>
+            )}
           </CardHeader>
+
           <CardContent>
             <div className="space-y-1">
               {lyrics.map((line) => (
@@ -317,18 +482,85 @@ export function KaraokePlayer({
                   key={line.id}
                   className={`rounded-lg px-4 py-3 transition-all duration-300 ${
                     activeLine?.id === line.id
-                      ? "animate-karaoke-highlight bg-primary/10 text-primary"
-                      : "text-foreground/70 hover:bg-muted"
+                      ? "bg-primary/10"
+                      : "hover:bg-muted"
                   }`}
                 >
-                  <p className="font-japanese text-lg leading-loose">
-                    {line.text}
-                  </p>
+                  {line.tokens && line.tokens.length > 0 ? (
+                    <p className="font-japanese text-lg leading-[2.4]">
+                      {line.tokens.map((token, ti) => {
+                        const selKey     = `${line.id}-${ti}`;
+                        const isSelected = selectedItems.some((s) => s.key === selKey);
+                        return (
+                          <TokenSpan
+                            key={ti}
+                            token={token}
+                            isSelected={isSelected}
+                            isHighlighted={activeLine?.id === line.id}
+                            onClick={() => handleTokenClick(token, ti, line)}
+                          />
+                        );
+                      })}
+                    </p>
+                  ) : (
+                    <p className="font-japanese text-lg leading-loose text-foreground/70">
+                      {line.text}
+                    </p>
+                  )}
                 </div>
               ))}
             </div>
           </CardContent>
         </Card>
+      )}
+
+      {/* Selection tray (fixed bottom bar when items selected) */}
+      {selectionMode && selectedItems.length > 0 && (
+        <div className="fixed bottom-6 left-1/2 z-30 flex -translate-x-1/2 items-center gap-3 rounded-full bg-primary px-5 py-3 text-sm font-medium text-white shadow-xl">
+          <span>
+            {selectedItems.length} word{selectedItems.length !== 1 ? "s" : ""} selected
+          </span>
+          <button
+            onClick={exportSelected}
+            className="rounded-full bg-white/20 px-3 py-1 transition hover:bg-white/30 active:scale-95"
+          >
+            Export to Anki
+          </button>
+          <button
+            onClick={clearSelection}
+            className="rounded-full px-2 py-1 text-white/70 transition hover:text-white"
+            aria-label="Clear selection"
+          >
+            ✕
+          </button>
+        </div>
+      )}
+
+      {/* Vocab card popup */}
+      {vocabState && (
+        <VocabCard
+          token={vocabState.token}
+          tokenIndex={vocabState.tokenIndex}
+          lineTokens={vocabState.line.tokens!}
+          lineText={vocabState.line.text}
+          startTime={vocabState.line.startTime}
+          songTitle={title}
+          onClose={() => setVocabState(null)}
+          onExport={handleVocabExport}
+        />
+      )}
+
+      {/* Anki export dialog (shared by vocab card + batch export) */}
+      {exportCards && (
+        <AnkiExportDialog
+          cards={exportCards}
+          deckName={title ? `${title} – Japanese Lyrics` : "Japanese Lyrics"}
+          open={true}
+          onClose={() => {
+            setExportCards(null);
+            clearSelection();
+          }}
+        />
       )}
     </div>
   );

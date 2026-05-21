@@ -4,7 +4,7 @@ import { ArrowLeft } from "lucide-react";
 import Link from "next/link";
 import { KaraokePlayer } from "@/components/karaoke-player";
 import { prisma } from "@/lib/prisma";
-import type { LyricLine, WordTiming } from "@japanese-lyrics/shared";
+import type { LyricLine, WordTiming, Token } from "@japanese-lyrics/shared";
 
 interface PlayerPageProps {
   params: { id: string };
@@ -22,7 +22,9 @@ async function getSong(id: string) {
     text:      line.japanese,
     startTime: line.startTime ?? 0,
     endTime:   line.endTime   ?? 0,
-    words:     line.words ? (JSON.parse(line.words) as WordTiming[]) : undefined,
+    words:     line.words    ? (JSON.parse(line.words)    as WordTiming[]) : undefined,
+    tokens:    line.tokens   ? (JSON.parse(line.tokens)   as Token[])     : undefined,
+    furigana:  line.analysis ? (JSON.parse(line.analysis) as { furigana?: string }).furigana : undefined,
   }));
 
   return {

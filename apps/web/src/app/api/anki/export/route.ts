@@ -4,7 +4,7 @@ import { cardsToAnkiTsv } from "@japanese-lyrics/anki";
 import { buildApkg } from "@/lib/apkg-builder";
 
 export async function POST(req: NextRequest) {
-  let body: { cards: ExportCard[]; deckName?: string; format?: "apkg" | "csv" };
+  let body: { cards: ExportCard[]; deckName?: string; format?: "apkg" | "csv" | "json" };
   try {
     body = await req.json();
   } catch {
@@ -25,6 +25,27 @@ export async function POST(req: NextRequest) {
       headers: {
         "Content-Type": "text/plain; charset=utf-8",
         "Content-Disposition": `attachment; filename="${sanitizeFilename(deckName)}.txt"`,
+      },
+    });
+  }
+
+  if (format === "json") {
+    const payload = {
+      deckName,
+      exportedAt: new Date().toISOString(),
+      count:      cards.length,
+      cards:      cards.map((c) => ({
+        front:    c.front,
+        back:     c.back,
+        tags:     c.tags ?? [],
+        deckName: c.deckName ?? deckName,
+      })),
+    };
+    return new NextResponse(JSON.stringify(payload, null, 2), {
+      status: 200,
+      headers: {
+        "Content-Type": "application/json; charset=utf-8",
+        "Content-Disposition": `attachment; filename="${sanitizeFilename(deckName)}.json"`,
       },
     });
   }

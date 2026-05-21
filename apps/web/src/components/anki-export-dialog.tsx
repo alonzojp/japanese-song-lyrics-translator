@@ -17,6 +17,7 @@ const METHOD_ICONS: Record<ExportMethod, string> = {
   ankiconnect: "⚡",
   apkg:        "📦",
   csv:         "📄",
+  json:        "{}",
   ankiweb:     "🌐",
 };
 
@@ -67,7 +68,7 @@ export function AnkiExportDialog({ cards, deckName = "Japanese Lyrics", open, on
     }
   }, [cards, deckName]);
 
-  const runDownload = useCallback(async (format: "apkg" | "csv") => {
+  const runDownload = useCallback(async (format: "apkg" | "csv" | "json") => {
     setStep("exporting");
     try {
       const res = await fetch("/api/anki/export", {
@@ -82,15 +83,16 @@ export function AnkiExportDialog({ cards, deckName = "Japanese Lyrics", open, on
       }
 
       const blob     = await res.blob();
-      const ext      = format === "apkg" ? "apkg" : "txt";
-      const filename = `${deckName.replace(/\s+/g, "_")}.${ext}`;
+      const extMap   = { apkg: "apkg", csv: "txt", json: "json" } as const;
+      const filename = `${deckName.replace(/\s+/g, "_")}.${extMap[format]}`;
       downloadBlob(blob, filename);
 
-      setSuccessMsg(
-        format === "apkg"
-          ? "Deck downloaded. Open the .apkg file to import into Anki."
-          : "File downloaded. In Anki: File → Import → select the .txt file.",
-      );
+      const msgMap = {
+        apkg: "Deck downloaded. Open the .apkg file to import into Anki.",
+        csv:  "File downloaded. In Anki: File → Import → select the .txt file.",
+        json: "JSON exported. Use it with custom scripts or import tools.",
+      };
+      setSuccessMsg(msgMap[format]);
       setStep("done");
     } catch (e) {
       setErrorMsg(e instanceof Error ? e.message : "Unknown error");
@@ -111,7 +113,7 @@ export function AnkiExportDialog({ cards, deckName = "Japanese Lyrics", open, on
       setStep("ankiweb-instructions");
       return;
     }
-    await runDownload(method as "apkg" | "csv");
+    await runDownload(method as "apkg" | "csv" | "json");
   }, [ankiConnectOk, runAnkiConnect, runDownload]);
 
   if (!open) return null;

@@ -14,6 +14,7 @@ export type ExportMethod =
   | "ankiconnect"   // Direct API to desktop Anki (requires AnkiConnect add-on)
   | "apkg"          // Download .apkg file (all platforms, import manually)
   | "csv"           // Download .csv file (Anki's text file importer)
+  | "json"          // Download structured JSON (dev/custom import scripts)
   | "ankiweb";      // Guided AnkiWeb workflow
 
 export type ExportStatus = "success" | "error" | "unavailable" | "pending";
@@ -114,6 +115,13 @@ export const EXPORT_METHOD_INFO: ExportMethodInfo[] = [
     label:       "Download .txt (CSV)",
     description: "Plain text export. Import via File → Import in Anki desktop.",
     platforms:   ["desktop"],
+    requiresApp: false,
+  },
+  {
+    method:      "json",
+    label:       "Download JSON",
+    description: "Structured JSON export for custom import scripts or developer use.",
+    platforms:   ["desktop", "ios", "android", "unknown"],
     requiresApp: false,
   },
   {

@@ -21,6 +21,7 @@ import {
   exportToCsv,
   downloadBlob,
 } from "./csv.js";
+import { exportToJson } from "./json.js";
 import {
   type ExportCard,
   type ExportMethod,
@@ -79,6 +80,8 @@ export class AnkiExporter {
         return this._exportApkg(cards);
       case "csv":
         return this._exportCsv(cards);
+      case "json":
+        return this._exportJson(cards);
       case "ankiweb":
         return this._exportAnkiWeb(cards);
     }
@@ -169,6 +172,14 @@ export class AnkiExporter {
 
   private _exportCsv(cards: ExportCard[]): ExportResult {
     const result = exportToCsv(cards, this.opts.defaultDeck);
+    if (result.status === "success" && result.blob && result.filename) {
+      downloadBlob(result.blob, result.filename);
+    }
+    return result;
+  }
+
+  private _exportJson(cards: ExportCard[]): ExportResult {
+    const result = exportToJson(cards, this.opts.defaultDeck);
     if (result.status === "success" && result.blob && result.filename) {
       downloadBlob(result.blob, result.filename);
     }
