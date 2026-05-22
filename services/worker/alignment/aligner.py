@@ -33,6 +33,19 @@ _MIN_SPLIT_SEP      = 1.0    # minimum seconds between detected split points
 _WORD_GAP_SPLIT_MS  = 120.0  # inter-word pause threshold for line boundary detection
 _MAX_CTC_LAG_S      = 3.0    # VAD anchor skipped when offset ≥ this (legitimate fill)
 
+# ── Feature flags ─────────────────────────────────────────────────────────────
+# Phase 1: text-informed segment mapping (char bigrams + English anchors + greedy monotone).
+# Set False to revert to duration-only assignment.
+USE_TEXT_AWARE_SEGMENT_MAPPING = True
+
+# Minimum score advantage for the text mapper to advance to the next segment.
+# Prevents spurious advances when all segments look similar (poor transcript).
+_TEXT_ADVANCE_BIAS = 0.15
+
+# When composite similarity falls below this threshold the mapper treats the
+# line as ambiguous and logs a LOW_CONFIDENCE warning.
+_TEXT_LOW_CONF_THRESHOLD = 0.12
+
 
 # ── WhisperX forced alignment ──────────────────────────────────────────────────
 
@@ -255,6 +268,350 @@ def _split_words_into_lines(
             })
 
     return result
+
+
+# ── Text-informed segment mapping (Phase 1 + 3) ──────────────────────────────
+
+# Common J-pop English loanwords → their expected hiragana form in ASR transcripts.
+# Used to match lyrics like "Tune" against transcript katakana like "チューン".
+# Entries are normalized (katakana→hiragana, long vowel ー kept as-is).
+_KANA_LOANWORDS: dict[str, str] = {
+    # Wonder Scale specific
+    "tune":     "ちゅーん",
+    "wonder":   "わんだー",
+    "scale":    "すけーる",
+    "stage":    "すてーじ",
+    # Common music/performance
+    "soul":     "そうる",
+    "song":     "そんぐ",
+    "dance":    "だんす",
+    "music":    "みゅーじっく",
+    "heart":    "はーと",
+    "star":     "すたー",
+    "shine":    "しゃいん",
+    "smile":    "すまいる",
+    "voice":    "ぼいす",
+    "dream":    "どりーむ",
+    "love":     "らぶ",
+    "world":    "わーるど",
+    "light":    "らいと",
+    "night":    "ないと",
+    "time":     "たいむ",
+    "life":     "らいふ",
+    "free":     "ふりー",
+    "true":     "とぅるー",
+    "false":    "ふぁるす",
+    "happy":    "はっぴー",
+    "baby":     "べいびー",
+    "magic":    "まじっく",
+    "miracle":  "みらくる",
+    "memory":   "めもりー",
+    "believe":  "びりーぶ",
+    "fantasy":  "ふぁんたじー",
+    "lonely":   "ろーんりー",
+    "tender":   "てんだー",
+    "color":    "からー",
+    "colour":   "からー",
+    "chance":   "ちゃんす",
+    "power":    "ぱわー",
+    "flower":   "ふらわー",
+    "story":    "すとーりー",
+    "feeling":  "ふぃーりんぐ",
+    "morning":  "もーにんぐ",
+    "moon":     "むーん",
+    "deep":     "でぃーぷ",
+    "super":    "すーぱー",
+    "cool":     "くーる",
+    "special":  "すぺしゃる",
+    "perfect":  "ぱーふぇくと",
+    "lucky":    "らっきー",
+    "crazy":    "くれいじー",
+    "hero":     "ひーろー",
+    "zero":     "ぜろ",
+    "summer":   "さまー",
+    "winter":   "うぃんたー",
+    "spring":   "すぷりんぐ",
+    "speed":    "すぴーど",
+    "limit":    "りみっと",
+    "rainbow":  "れいんぼー",
+    "natural":  "なちゅらる",
+    "forever":  "ふぉーえばー",
+    "together": "とぅぎゃざー",
+    "missing":  "みっしんぐ",
+    "shining":  "しゃいにんぐ",
+    "running":  "らんにんぐ",
+    "angel":    "えんじぇる",
+    "fire":     "ふぁいあ",
+    "rain":     "れいん",
+    "sky":      "すかい",
+    "girl":     "がーる",
+    "boy":      "ぼーい",
+    "wonder":   "わんだー",
+    "state":    "すてーと",
+    "wonder":   "わんだー",
+    # Common single-syllable words
+    "my":       "まい",
+    "your":     "ゆあ",
+    "new":      "にゅー",
+    "now":      "なう",
+    "go":       "ごー",
+    "oh":       "おー",
+    "hey":      "へい",
+    "yeah":     "いぇあ",
+}
+
+
+def _normalize_for_matching(text: str) -> str:
+    """
+    Normalize text for cross-script similarity comparison.
+    - Katakana → hiragana (U+30A1–U+30F6, offset 0x60)
+    - NFKC: full-width → half-width, composed forms
+    - Lowercase
+    - Strip punctuation; keep CJK, kana, alphanumeric
+    """
+    chars = []
+    for ch in text:
+        cp = ord(ch)
+        if 0x30A1 <= cp <= 0x30F6:      # katakana ァ–ヶ → hiragana
+            chars.append(chr(cp - 0x60))
+        else:
+            chars.append(ch)
+    text = unicodedata.normalize('NFKC', ''.join(chars)).lower()
+    # Keep: CJK (4E00-9FFF), hiragana (3040-309F), katakana remnants (30A0-30FF),
+    #       ASCII alphanumeric.  Drop everything else (punctuation, whitespace, etc.)
+    text = re.sub(r'[^぀-ヿ一-鿿＀-￯a-z0-9]', '', text)
+    return text
+
+
+def _char_bigrams(text: str) -> frozenset[str]:
+    """Return the set of consecutive character bigrams from normalized text."""
+    n = _normalize_for_matching(text)
+    if len(n) < 2:
+        return frozenset()
+    return frozenset(n[i:i + 2] for i in range(len(n) - 1))
+
+
+def _english_tokens(text: str) -> frozenset[str]:
+    """Return lower-cased English word tokens (letter sequences only)."""
+    return frozenset(w.lower() for w in re.findall(r'[A-Za-z]+', text))
+
+
+def _kana_loanword_sim(lyric: str, segment_text: str) -> float:
+    """
+    Phase 3 — katakana-English equivalence signal.
+
+    Handles the common J-pop case where the official lyric uses English
+    ("Tune", "Wonder Scale") but the ASR transcript uses katakana
+    ("チューン", "ワンダーステージ").
+
+    For each English token in the lyric, looks up its expected hiragana form
+    in _KANA_LOANWORDS and checks whether that form appears as a substring of
+    the normalized segment text.  Returns the fraction of English tokens that
+    matched via the kana route (0.0 if the lyric has no English).
+
+    This is a recall-oriented score: it rewards segments that contain the
+    katakana reading of the lyric's English words, even when the segment
+    contains no Latin characters at all.
+    """
+    lyric_eng = _english_tokens(lyric)
+    if not lyric_eng:
+        return 0.0
+
+    seg_norm = _normalize_for_matching(segment_text)
+    if not seg_norm:
+        return 0.0
+
+    matches = sum(
+        1 for eng in lyric_eng
+        if (kana := _KANA_LOANWORDS.get(eng)) and kana in seg_norm
+    )
+    return matches / len(lyric_eng)
+
+
+def _text_similarity(lyric: str, segment_text: str) -> float:
+    """
+    Composite similarity score in [0, 1] for one (lyric line, transcript segment) pair.
+
+    Three signals combined:
+    - char_sim:     bigram recall over normalized text (kana + kanji + latin)
+    - eng_sim:      English token recall — lyric English words found verbatim in segment
+    - kana_sim:     katakana-English equivalence — lyric English words found as their
+                    expected katakana readings in the segment (Phase 3)
+
+    eng_combined = max(eng_sim, kana_sim) ensures that whether the transcript
+    writes a word as English or as katakana, the match is credited.
+
+    When the lyric contains English, English/kana combined dominates (0.40/0.60).
+    Pure-Japanese lyrics use char_sim alone.
+    """
+    lyric_bg   = _char_bigrams(lyric)
+    seg_bg     = _char_bigrams(segment_text)
+    char_sim   = len(lyric_bg & seg_bg) / len(lyric_bg) if lyric_bg else 0.0
+
+    lyric_eng  = _english_tokens(lyric)
+    seg_eng    = _english_tokens(segment_text)
+    eng_sim    = len(lyric_eng & seg_eng) / len(lyric_eng) if lyric_eng else 0.0
+
+    if lyric_eng:
+        kana_sim     = _kana_loanword_sim(lyric, segment_text)
+        eng_combined = max(eng_sim, kana_sim)
+        score = 0.40 * char_sim + 0.60 * eng_combined
+    else:
+        score = char_sim
+
+    return round(score, 4)
+
+
+def _map_lines_to_segments_by_text(
+    rough_segments: AlignedSegments,
+    official_lines: list[dict],
+    job_log,
+) -> dict[int, list[str]]:
+    """
+    Assign official lyric lines to transcript segments using text similarity.
+
+    Phase 2 — globally optimal monotone assignment via dynamic programming.
+
+    dp[i][j] = best total score assigning lines 0..i-1 to segments 0..j-1.
+
+    Transition (for each cut point k):
+        group_score = mean(sim[t][j-1] for t in range(k, i))   # MEAN not sum
+        dp[i][j]   = max(dp[k][j-1] + group_score)
+
+    Using mean rather than sum prevents the DP from stuffing many lines into
+    one high-scoring segment.  Ordering is enforced structurally — the DP
+    never assigns a later line to an earlier segment.
+
+    Complexity: O(N² × M) — trivial at song scale (~23 lines × 10 segments).
+
+    Falls back to duration mapping when no feasible assignment exists.
+    """
+    N = len(official_lines)
+    M = len(rough_segments)
+
+    if N == 0 or M == 0:
+        return {}
+
+    seg_texts = [s.get('text', '') for s in rough_segments]
+
+    # ── Build full similarity matrix ──────────────────────────────────────────
+    sim: list[list[float]] = [
+        [_text_similarity(official_lines[i]['text'], seg_texts[j]) for j in range(M)]
+        for i in range(N)
+    ]
+
+    # ── Log full matrix at DEBUG level ────────────────────────────────────────
+    if job_log:
+        job_log.info(
+            f"[assign] Text similarity matrix ({N} lines × {M} segs) — "
+            f"top-2 scores per line:",
+            stage="transcribe",
+        )
+        for i, line in enumerate(official_lines):
+            ranked = sorted(enumerate(sim[i]), key=lambda x: -x[1])
+            top2   = " | ".join(f"S{j}={s:.2f}" for j, s in ranked[:2])
+            job_log.info(
+                f"[assign]   L{i:02d} '{line['text'][:28]}': {top2}",
+                stage="transcribe",
+            )
+
+    # ── DP: globally optimal monotone assignment ─────────────────────────────
+    # dp[i][j] = best total score assigning lines 0..i-1 to segments 0..j-1
+    # bp[i][j] = cut point k* that achieved dp[i][j]
+    _NEG_INF = float('-inf')
+
+    dp = [[_NEG_INF] * (M + 1) for _ in range(N + 1)]
+    bp = [[0]         * (M + 1) for _ in range(N + 1)]
+    dp[0][0] = 0.0
+
+    for j in range(1, M + 1):         # consider segments 0..j-1
+        for i in range(0, N + 1):     # first i lines assigned
+            # Segment j-1 receives lines k..i-1 (k==i → segment is empty)
+            for k in range(0, i + 1):
+                prev = dp[k][j - 1]
+                if prev == _NEG_INF:
+                    continue
+                if k == i:
+                    group_score = 0.0   # empty segment
+                else:
+                    group_score = (
+                        sum(sim[t][j - 1] for t in range(k, i)) / (i - k)
+                    )
+                candidate = prev + group_score
+                if candidate > dp[i][j]:
+                    dp[i][j] = candidate
+                    bp[i][j] = k
+
+    optimal_score = dp[N][M]
+
+    # ── Reconstruct assignment from backpointers ──────────────────────────────
+    groups: list[tuple[int, int, int]] = []   # (seg_idx, line_start, line_end)
+    i_cur, j_cur = N, M
+    while j_cur > 0:
+        k_star = bp[i_cur][j_cur]
+        groups.append((j_cur - 1, k_star, i_cur))
+        i_cur  = k_star
+        j_cur -= 1
+    groups.reverse()
+
+    # Build output and collect per-line stats
+    seg_to_lines:   dict[int, list[str]] = {}
+    low_conf_lines: list[int]            = []
+
+    for seg_idx, start, end in groups:
+        if start == end:
+            continue   # segment received no lines
+        texts: list[str] = []
+        for t in range(start, end):
+            score = sim[t][seg_idx]
+            texts.append(official_lines[t]['text'])
+            if score < _TEXT_LOW_CONF_THRESHOLD:
+                low_conf_lines.append(t)
+        seg_to_lines[seg_idx] = texts
+
+    # ── Log DP result ─────────────────────────────────────────────────────────
+    if job_log:
+        job_log.info(
+            f"[assign] DP optimal score={optimal_score:.4f} "
+            f"({N} lines, {M} segs)",
+            stage="transcribe",
+        )
+        for seg_idx, start, end in groups:
+            if start == end:
+                continue
+            n_grp    = end - start
+            mean_sim = sum(sim[t][seg_idx] for t in range(start, end)) / n_grp
+            job_log.info(
+                f"[assign]   Seg{seg_idx}: lines {start}–{end - 1} "
+                f"({n_grp} lines, mean_sim={mean_sim:.2f})",
+                stage="transcribe",
+            )
+            for t in range(start, end):
+                score = sim[t][seg_idx]
+                flag  = " ⚑LOW_CONF" if score < _TEXT_LOW_CONF_THRESHOLD else ""
+                job_log.info(
+                    f"[assign]     L{t:02d} sim={score:.2f}{flag}  "
+                    f"'{official_lines[t]['text'][:32]}'",
+                    stage="transcribe",
+                )
+
+    if low_conf_lines and job_log:
+        job_log.warning(
+            f"[assign] LOW_CONFIDENCE on {len(low_conf_lines)} line(s): "
+            f"{low_conf_lines} — transcript may be too garbled for text mapping",
+            stage="transcribe",
+        )
+
+    if job_log:
+        lines_per_seg = {seg_idx: end - start
+                         for seg_idx, start, end in groups if start < end}
+        job_log.info(
+            f"[assign] DP assignment complete (score={optimal_score:.3f}): "
+            f"{lines_per_seg}",
+            stage="transcribe",
+        )
+
+    return seg_to_lines
 
 
 def _map_lines_to_segments_by_duration(
@@ -738,8 +1095,17 @@ def _align_whisperx_with_official_lyrics(
             stage="transcribe",
         )
 
-    # ── 1. Duration-weighted segment assignment ───────────────────────────────
-    seg_to_lines = _map_lines_to_segments_by_duration(rough_segments, official_lines)
+    # ── 1. Segment-to-lyric assignment ───────────────────────────────────────
+    if USE_TEXT_AWARE_SEGMENT_MAPPING:
+        seg_to_lines = _map_lines_to_segments_by_text(rough_segments, official_lines, job_log)
+    else:
+        seg_to_lines = _map_lines_to_segments_by_duration(rough_segments, official_lines)
+    if job_log:
+        method_label = "text-aware" if USE_TEXT_AWARE_SEGMENT_MAPPING else "duration"
+        job_log.info(
+            f"[assign] Segment mapping method: {method_label}",
+            stage="transcribe",
+        )
 
     # Debug instrumentation — observability only, no effect on alignment
     from alignment.debug import AlignmentDebugger

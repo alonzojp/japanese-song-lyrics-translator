@@ -120,10 +120,13 @@ function LogPanel({ logs }: { logs: JobLogEntry[] }) {
   const [open, setOpen]   = useState(false);
   const containerRef      = useRef<HTMLDivElement>(null);
 
-  // Scroll the log container itself, not the page
+  // Auto-scroll only when already near the bottom — don't interrupt manual scrolling
   useEffect(() => {
-    if (open && containerRef.current) {
-      containerRef.current.scrollTop = containerRef.current.scrollHeight;
+    if (!open || !containerRef.current) return;
+    const c = containerRef.current;
+    const atBottom = c.scrollHeight - c.scrollTop - c.clientHeight < 60;
+    if (atBottom) {
+      c.scrollTop = c.scrollHeight;
     }
   }, [logs, open]);
 
