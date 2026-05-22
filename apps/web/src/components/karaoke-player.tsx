@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   Play, Pause, Loader2, CheckCircle2, XCircle, Zap,
   ChevronDown, ChevronUp, Terminal, BookOpen, MousePointer2,
@@ -252,22 +252,49 @@ export function KaraokePlayer({
   // ── Derived ───────────────────────────────────────────────────────────────────
   const hasTokens  = lyrics.some((l) => l.tokens && l.tokens.length > 0);
 
-  // Active line: the line whose acoustic window contains currentTime.
-  const activeLine = lyrics.find((l) => currentTime >= l.startTime && currentTime <= l.endTime);
-  const activeIdx  = activeLine ? lyrics.findIndex((l) => l.id === activeLine.id) : -1;
+  // Clamp endTimes so no line extends past the next line's start.
+  // This eliminates DTW-produced overlaps before any display logic sees them.
+  const processedLyrics = useMemo(() =>
+    lyrics.map((line, i) => {
+      const nextStart  = lyrics[i + 1]?.startTime;
+      const clampedEnd = nextStart !== undefined
+        ? Math.min(line.endTime, nextStart - 0.05)
+        : line.endTime;
+      if (process.env.NODE_ENV !== "production") {
+        const dur = clampedEnd - line.startTime;
+        if (dur > 12) {
+          console.warn(
+            `LONG_LINE_WARNING: line ${i} "${line.text.slice(0, 30)}" ` +
+            `visual_duration=${dur.toFixed(1)}s (raw_end=${line.endTime.toFixed(3)})`
+          );
+        }
+      }
+      return clampedEnd === line.endTime ? line : { ...line, endTime: clampedEnd };
+    }),
+    [lyrics],
+  );
+
+  // Active line: last line whose clamped window contains currentTime.
+  // reduce() scans all lines so the highest-index match wins — handles any residual overlap.
+  const activeIdx = processedLyrics.reduce<number>(
+    (best, l, i) =>
+      currentTime >= l.startTime && currentTime <= l.endTime ? i : best,
+    -1,
+  );
+  const activeLine = activeIdx >= 0 ? processedLyrics[activeIdx] : null;
 
   // Incoming line: the next line, shown early to give the learner a reading head-start.
   const incomingLine: LyricLine | null =
-    activeIdx >= 0 && activeIdx + 1 < lyrics.length &&
-    currentTime >= lyrics[activeIdx + 1].startTime - LEAD_IN_S
-      ? lyrics[activeIdx + 1]
+    activeIdx >= 0 && activeIdx + 1 < processedLyrics.length &&
+    currentTime >= processedLyrics[activeIdx + 1].startTime - LEAD_IN_S
+      ? processedLyrics[activeIdx + 1]
       : null;
 
   // Lingering line: the previous line, briefly kept visible after a transition.
   const lingeringLine: LyricLine | null =
     activeIdx > 0 && activeLine &&
     currentTime < activeLine.startTime + LINGER_S
-      ? lyrics[activeIdx - 1]
+      ? processedLyrics[activeIdx - 1]
       : null;
 
   const isActive    = jobStatus === "queued" || jobStatus === "processing";
@@ -722,7 +749,7 @@ export function KaraokePlayer({
 
           <CardContent>
             <div className="space-y-1">
-              {lyrics.map((line) => {
+              {processedLyrics.map((line) => {
                 const isCurrentLine  = activeLine?.id   === line.id;
                 const isNextLine     = incomingLine?.id === line.id;
                 const isPreviousLine = lingeringLine?.id === line.id;
