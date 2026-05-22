@@ -117,17 +117,26 @@ function StepRow({ step }: { step: JobStepInfo }) {
 // ── Log panel ──────────────────────────────────────────────────────────────────
 
 function LogPanel({ logs }: { logs: JobLogEntry[] }) {
-  const [open, setOpen]   = useState(false);
-  const containerRef      = useRef<HTMLDivElement>(null);
+  const [open, setOpen]        = useState(false);
+  const containerRef           = useRef<HTMLDivElement>(null);
+  const userScrolledUpRef      = useRef(false);
 
-  // Auto-scroll only when already near the bottom — don't interrupt manual scrolling
+  // Reset intent flag when panel opens so it starts pinned to bottom
   useEffect(() => {
-    if (!open || !containerRef.current) return;
+    if (open) userScrolledUpRef.current = false;
+  }, [open]);
+
+  // Detect when the user manually scrolls away from the bottom
+  const handleScroll = () => {
     const c = containerRef.current;
-    const atBottom = c.scrollHeight - c.scrollTop - c.clientHeight < 60;
-    if (atBottom) {
-      c.scrollTop = c.scrollHeight;
-    }
+    if (!c) return;
+    userScrolledUpRef.current = c.scrollHeight - c.scrollTop - c.clientHeight > 60;
+  };
+
+  // Auto-scroll only when user has not scrolled up
+  useEffect(() => {
+    if (!open || !containerRef.current || userScrolledUpRef.current) return;
+    containerRef.current.scrollTop = containerRef.current.scrollHeight;
   }, [logs, open]);
 
   if (logs.length === 0) return null;
@@ -148,6 +157,7 @@ function LogPanel({ logs }: { logs: JobLogEntry[] }) {
       {open && (
         <div
           ref={containerRef}
+          onScroll={handleScroll}
           className="max-h-52 overflow-y-auto border-t border-border px-4 py-2 font-mono"
         >
           {logs.map((entry, i) => (
