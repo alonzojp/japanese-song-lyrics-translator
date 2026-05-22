@@ -25,9 +25,12 @@ logger = logging.getLogger(__name__)
 
 # Lyrics blocks in descriptions are usually preceded by a header line
 _LYRICS_HEADER_RE = re.compile(
-    r"(?:lyrics?|歌詞|作詞|lyric|words?)[：:＝=\s]*\n",
+    r"(?:▶\s*lyrics?|▶\s*lyric|lyrics?|歌詞|作詞|lyric|words?)[：:＝=\s]*\n",
     re.IGNORECASE,
 )
+
+# Lines that look like credits (role: person) — used to reject credits blocks
+_CREDITS_LINE_RE = re.compile(r"^.{1,15}[：:].{1,30}$")
 
 # Minimum Japanese character ratio to consider a block as lyrics
 _MIN_JA_RATIO = 0.35
@@ -37,7 +40,7 @@ _MIN_LINES = 4
 
 class DescriptionProvider(LyricsProvider):
     name     = "description"
-    priority = 3
+    priority = 6
 
     async def fetch(self, video: VideoInfo) -> Optional[LyricsResult]:
         description = video.description
@@ -112,12 +115,18 @@ def _extract_lyrics_block(description: str) -> Optional[str]:
         return block.strip()
 
     # Fallback: split into paragraphs, return the one with highest Japanese density
+    # that doesn't look like credits (role: person format)
     paragraphs = re.split(r"\n{2,}", description.strip())
     best_block: Optional[str] = None
     best_ratio  = 0.0
     for para in paragraphs:
+        lines = para.splitlines()
+        # Skip blocks where most lines look like credits
+        credits_count = sum(1 for ln in lines if _CREDITS_LINE_RE.match(ln.strip()))
+        if len(lines) > 0 and credits_count / len(lines) > 0.5:
+            continue
         ratio = japanese_char_ratio(para)
-        if ratio > best_ratio and ratio > _MIN_JA_RATIO and len(para.splitlines()) >= _MIN_LINES:
+        if ratio > best_ratio and ratio > _MIN_JA_RATIO and len(lines) >= _MIN_LINES:
             best_ratio = ratio
             best_block = para
 

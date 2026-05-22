@@ -13,6 +13,7 @@ const WORKER_URL = process.env.WORKER_URL ?? "http://localhost:8000";
 async function workerFetch<T>(path: string, init?: RequestInit): Promise<T> {
   const res = await fetch(`${WORKER_URL}${path}`, {
     ...init,
+    cache: "no-store",   // never cache — job status must always be fresh
     headers: {
       "Content-Type": "application/json",
       ...(init?.headers ?? {}),
@@ -60,5 +61,9 @@ export const workerClient = {
       method: "POST",
       body: JSON.stringify({ text }),
     });
+  },
+
+  matchLyrics(youtubeId: string): Promise<{ lines: Array<{ text: string; startTime: number; endTime: number; words?: unknown[] }> }> {
+    return workerFetch(`/alignment/${youtubeId}/match`, { method: "POST" });
   },
 };

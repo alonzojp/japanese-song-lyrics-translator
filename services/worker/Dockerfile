@@ -6,6 +6,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
     git \
     wget \
+    libgomp1 \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
@@ -21,7 +22,8 @@ RUN pip install --no-cache-dir \
 
 COPY requirements.txt .
 # Install remaining deps (whisperx installs from git, needs git above)
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir --upgrade pip setuptools wheel && \
+    pip install --no-cache-dir -r requirements.txt
 
 # ── Runtime ────────────────────────────────────────────────────────────────────
 FROM base AS runner

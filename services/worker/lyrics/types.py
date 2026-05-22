@@ -20,13 +20,47 @@ class VideoInfo:
     duration:    Optional[float] = None
 
     @property
+    def song_title(self) -> Optional[str]:
+        """
+        Best guess at the actual song title.
+        Extracts content from 「」『』 first — Japanese YouTube titles commonly use
+        these to wrap the song name (e.g. 'Artist 「Song Name」Official MV').
+        Falls back to cleaned_title.
+        """
+        if not self.title:
+            return None
+        import re
+        m = re.search(r'[「『](.+?)[」』]', self.title)
+        if m:
+            return m.group(1).strip()
+        return self.cleaned_title
+
+    @property
+    def cleaned_title(self) -> Optional[str]:
+        """Title with 【...】（...）[] bracket sections stripped — common in Vocaloid/NicoNico uploads."""
+        if not self.title:
+            return None
+        import re
+        t = re.sub(r'[【〔\[].*?[】〕\]]', '', self.title)
+        t = re.sub(r'[（(].*?[）)]', '', t)
+        t = re.sub(r'\s+', ' ', t).strip()
+        return t or self.title
+
+    @property
     def search_query(self) -> str:
+        """Uploader + song title — best for full-text search on lyric sites."""
         parts = []
         if self.uploader:
             parts.append(self.uploader)
-        if self.title:
-            parts.append(self.title)
+        title = self.song_title or self.title
+        if title:
+            parts.append(title)
         return " ".join(parts) if parts else self.youtube_id
+
+    @property
+    def title_only_query(self) -> str:
+        """Just the song title — fallback when uploader name confuses the search."""
+        return self.song_title or self.title or self.youtube_id
 
 
 @dataclass

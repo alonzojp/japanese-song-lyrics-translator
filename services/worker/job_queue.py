@@ -60,7 +60,7 @@ def _conn() -> Generator[sqlite3.Connection, None, None]:
 
 def _default_steps() -> list[JobStepInfo]:
     return [
-        JobStepInfo(name=name, label=label, status=JobStatus.queued, progress=0)
+        JobStepInfo(name=name, label=label, status=JobStatus.queued, progress=0, message=None)
         for name, label in PIPELINE_STEPS
     ]
 
@@ -74,6 +74,7 @@ def _row_to_job(row: sqlite3.Row) -> Job:
             status=JobStatus(s["status"]),
             progress=s["progress"],
             error=s.get("error"),
+            message=s.get("message"),
         )
         for s in steps_raw
     ]
@@ -125,6 +126,24 @@ def get_queue_depth() -> int:
     return row[0] if row else 0
 
 
+def update_step_message(job_id: str, step_name: str, message: str) -> None:
+    """Update only the human-readable message for a step without touching status/progress."""
+    now = datetime.now(timezone.utc).isoformat()
+    with _conn() as conn:
+        row = conn.execute("SELECT steps_json FROM jobs WHERE id = ?", (job_id,)).fetchone()
+        if not row:
+            return
+        steps = json.loads(row["steps_json"])
+        for s in steps:
+            if s["name"] == step_name:
+                s["message"] = message
+        conn.execute(
+            "UPDATE jobs SET steps_json = ?, updated_at = ? WHERE id = ?",
+            (json.dumps(steps), now, job_id),
+        )
+        conn.commit()
+
+
 def update_job_step(
     job_id: str,
     step_name: str,
@@ -132,6 +151,7 @@ def update_job_step(
     step_progress: int,
     overall_progress: int,
     error: Optional[str] = None,
+    message: Optional[str] = None,
 ) -> None:
     now = datetime.now(timezone.utc).isoformat()
     with _conn() as conn:
@@ -144,6 +164,8 @@ def update_job_step(
                 s["status"]   = step_status.value
                 s["progress"] = step_progress
                 s["error"]    = error
+                if message is not None:
+                    s["message"] = message
         conn.execute(
             """UPDATE jobs SET
                status        = CASE WHEN ? = 'failed' THEN 'failed' ELSE status END,
@@ -180,6 +202,19 @@ def set_job_status(
             (status.value, result_path, error, now, job_id),
         )
         conn.commit()
+
+
+def reset_interrupted_jobs() -> int:
+    """Mark any processing/queued jobs as failed — called on worker startup."""
+    now = datetime.now(timezone.utc).isoformat()
+    with _conn() as conn:
+        cur = conn.execute(
+            """UPDATE jobs SET status='failed', error='Worker restarted', updated_at=?
+               WHERE status IN ('processing', 'queued')""",
+            (now,),
+        )
+        conn.commit()
+    return cur.rowcount
 
 
 def get_result_path(job_id: str) -> Optional[str]:

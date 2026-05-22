@@ -265,6 +265,115 @@ class AlignedLine:
     anchor_distance: int   = -1
 
 
+def _subdivide_shared_segments(lines: list[dict]) -> None:
+    """
+    Fallback: when multiple consecutive lines share the same segment,
+    divide the time range evenly. Used only when char-level matching fails.
+    """
+    i = 0
+    while i < len(lines):
+        j = i + 1
+        while j < len(lines) and lines[j]['startTime'] == lines[i]['startTime'] and lines[j]['endTime'] == lines[i]['endTime']:
+            j += 1
+        if j - i > 1 and lines[i]['startTime'] > 0.0:
+            seg_start = lines[i]['startTime']
+            seg_end   = lines[i]['endTime']
+            count     = j - i
+            duration  = (seg_end - seg_start) / count
+            for k in range(count):
+                lines[i + k]['startTime'] = round(seg_start + k * duration, 3)
+                lines[i + k]['endTime']   = round(seg_start + (k + 1) * duration, 3)
+        i = j
+
+
+def _flatten_words(word_segments: list[dict]) -> list[tuple[str, float, float]]:
+    """Flatten WhisperX word-level data into (char, start, end) tuples."""
+    flat: list[tuple[str, float, float]] = []
+    for seg in word_segments:
+        for w in seg.get('words', []):
+            s = w.get('start')
+            e = w.get('end')
+            c = w.get('word', '')
+            if s is not None and e is not None and c:
+                flat.append((c, float(s), float(e)))
+    return flat
+
+
+def _norm_chars(text: str) -> str:
+    """Normalize text to bare CJK/kana/alnum for character-level matching."""
+    s = unicodedata.normalize('NFKC', text)
+    s = _kata_to_hira(s)
+    s = re.sub(r'[^぀-ゟ一-鿿㐀-䶿a-z0-9]', '', s)
+    return s.lower()
+
+
+def _apply_char_timestamps(
+    matched_lines: list[dict],
+    word_segments: list[dict],
+) -> list[dict]:
+    """
+    Replace segment-level timestamps with precise character-level timestamps
+    by sliding a window over WhisperX's character sequence and matching each
+    lyric line's characters to the closest position.
+
+    Falls back to the existing timestamp if no good match is found.
+    """
+    flat = _flatten_words(word_segments)
+    if not flat:
+        return matched_lines
+
+    # Build normalised char sequence with per-char timestamps
+    tx_chars: list[tuple[str, float, float]] = []
+    for word, s, e in flat:
+        chars = _norm_chars(word)
+        if not chars:
+            continue
+        # Distribute word timing evenly across its characters
+        n = len(chars)
+        step = (e - s) / n
+        for k, c in enumerate(chars):
+            tx_chars.append((c, round(s + k * step, 3), round(s + (k + 1) * step, 3)))
+
+    if not tx_chars:
+        return matched_lines
+
+    tx_str    = ''.join(c for c, _, _ in tx_chars)
+    tx_cursor = 0
+    result: list[dict] = []
+
+    for line in matched_lines:
+        line_norm = _norm_chars(line.get('text', ''))
+
+        if not line_norm or tx_cursor >= len(tx_chars):
+            result.append(line)
+            continue
+
+        win        = max(1, len(line_norm))
+        search_end = min(len(tx_chars), tx_cursor + win + 100)
+        search_str = tx_str[tx_cursor:search_end]
+
+        best_pos   = -1
+        best_score = 0.0
+
+        for offset in range(max(1, len(search_str) - win + 1)):
+            window = search_str[offset:offset + win]
+            score  = bigram_sim(line_norm, window)
+            if score > best_score:
+                best_score = score
+                best_pos   = tx_cursor + offset
+
+        if best_pos >= 0 and best_score > 0.12:
+            match_end  = min(best_pos + win - 1, len(tx_chars) - 1)
+            start_t    = tx_chars[best_pos][1]
+            end_t      = tx_chars[match_end][2]
+            result.append({**line, 'startTime': start_t, 'endTime': end_t})
+            tx_cursor  = match_end + 1
+        else:
+            result.append(line)
+
+    return result
+
+
 def match_lyric_lines(
     transcript:     list[dict],
     official_lines: list[dict],
@@ -335,8 +444,8 @@ def match_lyric_lines(
             'officialIndex':   i,
             'transcriptIndex': j,
             'similarity':      sim_matrix[i][j],
-            'startTime':       seg.get('startTime', seg.get('start_time', 0.0)),
-            'endTime':         seg.get('endTime',   seg.get('end_time',   0.0)),
+            'startTime':       seg.get('startTime', seg.get('start_time', seg.get('start', 0.0))),
+            'endTime':         seg.get('endTime',   seg.get('end_time',   seg.get('end',   0.0))),
             'isChorus':        i in chorus_map,
         })
 
@@ -407,6 +516,11 @@ def match_lyric_lines(
             'anchorDistance':  anc_dist,
         })
 
+    # Refine timestamps using character-level word alignment (more precise than
+    # segment-level matching). Falls back to even subdivision if it fails.
+    lines = _apply_char_timestamps(lines, transcript)
+    _subdivide_shared_segments(lines)  # fallback for any remaining shared segments
+
     avg_conf = sum(l['confidence'] for l in lines) / max(1, len(lines))
     avg_sim  = sum(l['textSimilarity'] for l in lines) / max(1, len(lines))
     flagged  = [i for i, l in enumerate(lines) if l['confidence'] < 0.45]
@@ -437,44 +551,69 @@ def run_offline_match(
     job_log=None,
 ) -> Optional[dict]:
     """
-    Load aligned_words.json + lyrics_cached.json for a video,
-    run match_lyric_lines, and save matched_lyrics.json.
+    Load aligned_words.json + lyrics for a video, run match_lyric_lines,
+    and save matched_lyrics.json.
+
+    Lyrics source priority:
+      1. lyrics_manual.txt  — user-pasted override (plain text, one line per line)
+      2. lyrics_cached.json — auto-fetched from providers
 
     Returns the result dict, or None if inputs are missing.
     """
     aligned_path = output_dir / 'aligned_words.json'
+    manual_path  = output_dir / 'lyrics_manual.txt'
     lyrics_path  = output_dir / 'lyrics_cached.json'
 
-    if not aligned_path.exists() or not lyrics_path.exists():
+    if not aligned_path.exists():
         if job_log:
-            job_log.info(
-                'Skipping offline match: missing aligned_words.json or lyrics_cached.json',
-                stage='align',
-            )
+            job_log.info('Skipping offline match: missing aligned_words.json', stage='align')
+        return None
+
+    # Prefer manually pasted lyrics over auto-fetched ones
+    if manual_path.exists():
+        raw_text = manual_path.read_text(encoding='utf-8').strip()
+        official_lines = [
+            {'index': i, 'text': ln.strip()}
+            for i, ln in enumerate(raw_text.splitlines())
+            if ln.strip()
+        ]
+        source = 'manual'
+    elif lyrics_path.exists():
+        lyrics_data = json.loads(lyrics_path.read_text(encoding='utf-8'))
+        official_lines = [
+            {'index': i, 'text': ln.get('text', ln.get('japanese', ''))}
+            for i, ln in enumerate(lyrics_data.get('lines', lyrics_data.get('lyrics', [])))
+        ]
+        source = 'cached'
+    else:
+        if job_log:
+            job_log.info('Skipping offline match: no lyrics available', stage='align')
         return None
 
     aligned_data = json.loads(aligned_path.read_text(encoding='utf-8'))
-    lyrics_data  = json.loads(lyrics_path.read_text(encoding='utf-8'))
-
-    transcript      = aligned_data.get('segments', [])
-    official_lines  = [
-        {'index': i, 'text': ln.get('text', ln.get('japanese', ''))}
-        for i, ln in enumerate(lyrics_data.get('lines', lyrics_data.get('lyrics', [])))
-    ]
+    transcript   = aligned_data.get('segments', [])
 
     if not transcript or not official_lines:
         return None
 
+    if job_log:
+        job_log.info(
+            f"Matching {len(official_lines)} lines from {source} lyrics "
+            f"to {len(transcript)} transcript segments",
+            stage='align',
+        )
+
     result = match_lyric_lines(transcript, official_lines, job_log=job_log)
-    result['youtubeId'] = youtube_id
-    result['matchedAt'] = datetime.now(timezone.utc).isoformat()
+    result['youtubeId']   = youtube_id
+    result['matchedAt']   = datetime.now(timezone.utc).isoformat()
+    result['lyricsSource'] = source
 
     out_path = output_dir / MATCHED_FILE
     out_path.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding='utf-8')
 
     if job_log:
         job_log.info(
-            f"Wrote matched_lyrics.json ({len(result['lines'])} lines)",
+            f"Wrote matched_lyrics.json ({len(result['lines'])} lines, source={source})",
             stage='align',
         )
     return result

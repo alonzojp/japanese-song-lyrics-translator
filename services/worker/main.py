@@ -17,7 +17,8 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from typing import Optional
 
-from alignment.matcher import match_lyric_lines, run_offline_match
+from alignment.matcher   import match_lyric_lines, run_offline_match
+from alignment.selector  import select_best_alignment
 from cache import cache_dir, cleanup_old, list_cached
 from config import CACHE_MAX_AGE_DAYS, WHISPER_MODEL, WORKER_CONCURRENCY
 from logs import get_recent_logs
@@ -26,7 +27,7 @@ from lyrics.providers.manual import store_manual
 from lyrics.types import VideoInfo
 from models import CreateJobRequest, JobStatus, WorkerHealth
 from pipeline import run_job
-from queue import create_job, get_job, get_queue_depth, get_result_path
+from job_queue import create_job, get_job, get_queue_depth, get_result_path, reset_interrupted_jobs
 
 logging.basicConfig(
     level=logging.INFO,
@@ -39,7 +40,11 @@ _executor = ThreadPoolExecutor(max_workers=WORKER_CONCURRENCY)
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
-    # Startup: evict stale cache entries
+    # Startup: reset any jobs interrupted by a previous container crash
+    reset_count = reset_interrupted_jobs()
+    if reset_count:
+        logger.info("Startup: reset %d interrupted job(s) to failed", reset_count)
+    # Evict stale cache entries
     deleted = cleanup_old(max_age_days=CACHE_MAX_AGE_DAYS)
     if deleted:
         logger.info("Startup cache cleanup: removed %d stale entries", len(deleted))
@@ -151,16 +156,17 @@ async def get_result_endpoint(job_id: str) -> dict:
     data["jobId"]  = job_id
     data["songId"] = job.song_id
 
-    # Enrich with alignment metadata + aligned lines if available
     result_dir = Path(result_path).parent
-    for extra_file, key in [
-        ("aligned_lines.json",  "alignedLines"),
-        ("alignment_meta.json", "alignmentMeta"),
-    ]:
-        extra_path = result_dir / extra_file
-        if extra_path.exists():
-            extra = json.loads(extra_path.read_text(encoding="utf-8"))
-            data[key] = extra.get("lines", extra) if key == "alignedLines" else extra
+
+    # Select the best available alignment — quality-gated, never blindly prefer DTW
+    selection = select_best_alignment(result_dir)
+    data["alignedLines"]      = selection["lines"]
+    data["matchedStats"]      = selection["stats"]
+    data["alignmentSelection"] = selection["selection_meta"]
+
+    meta_path = result_dir / "alignment_meta.json"
+    if meta_path.exists():
+        data["alignmentMeta"] = json.loads(meta_path.read_text(encoding="utf-8"))
 
     return data
 

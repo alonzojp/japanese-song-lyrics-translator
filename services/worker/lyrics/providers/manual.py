@@ -30,7 +30,7 @@ _MIN_LINES  = 2
 
 class ManualProvider(LyricsProvider):
     name     = "manual"
-    priority = 8
+    priority = 9
 
     async def fetch(self, video: VideoInfo) -> Optional[LyricsResult]:
         manual_path = cache_dir(video.youtube_id) / MANUAL_FILE

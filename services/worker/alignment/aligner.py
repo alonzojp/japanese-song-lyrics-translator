@@ -15,6 +15,7 @@ from __future__ import annotations
 import logging
 import re
 import tempfile
+import unicodedata
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -24,6 +25,13 @@ logger = logging.getLogger(__name__)
 
 AlignedSegments  = list[dict]   # same shape as transcriber output
 AlignmentMethod  = str          # whisperx | aeneas | gentle | even
+
+# ── Segment quality thresholds ────────────────────────────────────────────────
+_MIN_DUR_PER_LINE   = 0.40   # seconds — below this a segment is "collapsed"
+_RMS_HOP_MS         = 50     # ms per RMS window for silence detection
+_MIN_SPLIT_SEP      = 1.0    # minimum seconds between detected split points
+_WORD_GAP_SPLIT_MS  = 120.0  # inter-word pause threshold for line boundary detection
+_MAX_CTC_LAG_S      = 3.0    # VAD anchor skipped when offset ≥ this (legitimate fill)
 
 
 # ── WhisperX forced alignment ──────────────────────────────────────────────────
@@ -188,21 +196,842 @@ def _align_even(
     return enriched, "even"
 
 
+# ── Official lyrics forced alignment ──────────────────────────────────────────
+
+def _char_count(text: str) -> int:
+    """Count non-whitespace characters after NFKC normalization."""
+    return len(re.sub(r'\s', '', unicodedata.normalize('NFKC', text)))
+
+
+def _split_words_into_lines(
+    words:      list[dict],
+    line_texts: list[str],
+    parent_seg: dict,
+) -> list[dict]:
+    """
+    Distribute word-level timestamps proportionally across lyric lines
+    based on character count. Falls back to even time split if no words.
+    """
+    if not words:
+        # Character-proportional distribution — longer lines get more time.
+        # Previously used equal slices (dur/n), which ignored character count.
+        return _proportional_line(parent_seg, line_texts)
+
+    counts  = [max(1, _char_count(t)) for t in line_texts]
+    total_c = sum(counts)
+    total_w = len(words)
+    result  = []
+    widx    = 0
+
+    for i, (text, count) in enumerate(zip(line_texts, counts)):
+        if i == len(line_texts) - 1:
+            line_words = words[widx:]
+        else:
+            n = max(1, round(count / total_c * total_w))
+            line_words = words[widx:widx + n]
+            widx += n
+
+        if line_words:
+            # For the first line in a segment, use the Whisper segment boundary rather
+            # than the first word's CTC timestamp. The VAD boundary is closer to actual
+            # vocal onset; CTC timestamps lag ~0.5-2s behind the audible voice.
+            start_t = (
+                parent_seg.get('start', 0.0)
+                if i == 0
+                else line_words[0].get('start', parent_seg.get('start', 0.0))
+            )
+            result.append({
+                'text':  text,
+                'start': round(start_t, 3),
+                'end':   round(line_words[-1].get('end', parent_seg.get('end', 0.0)), 3),
+                'words': line_words,
+            })
+        else:
+            result.append({
+                'text':  text,
+                'start': parent_seg.get('start', 0.0),
+                'end':   parent_seg.get('end',   0.0),
+                'words': [],
+            })
+
+    return result
+
+
+def _map_lines_to_segments_by_duration(
+    rough_segments: AlignedSegments,
+    official_lines: list[dict],
+) -> dict[int, list[str]]:
+    """
+    Map lyric lines to Whisper segments proportionally by segment duration.
+
+    More reliable than DTW when transcription text quality is low (~35%
+    similarity) because it uses audio timing rather than text matching.
+    A longer segment gets more lyric lines; gaps (instrumentals) are
+    automatically respected because line fractions skip over them.
+    """
+    n = len(official_lines)
+    m = len(rough_segments)
+
+    durations  = [max(0.1, s.get('end', 0) - s.get('start', 0)) for s in rough_segments]
+    total_dur  = sum(durations)
+
+    # Cumulative fraction at the START of each segment
+    cum: list[float] = [0.0]
+    for d in durations:
+        cum.append(cum[-1] + d / total_dur)
+
+    seg_to_lines: dict[int, list[str]] = {}
+    for i, line in enumerate(official_lines):
+        frac = (i + 0.5) / n          # position of this line in the song
+        # find segment whose range contains frac
+        assigned = m - 1
+        for j in range(m):
+            if cum[j] <= frac < cum[j + 1]:
+                assigned = j
+                break
+        seg_to_lines.setdefault(assigned, []).append(line['text'])
+
+    return seg_to_lines
+
+
+def _proportional_line(
+    seg:        dict,
+    line_texts: list[str],
+) -> list[dict]:
+    """
+    Distribute a segment's time range across lyric lines proportionally
+    by character count. Reliable fallback when acoustic alignment drifts.
+    """
+    start  = seg.get('start', 0.0)
+    end    = seg.get('end',   0.0)
+    counts = [max(1, _char_count(t)) for t in line_texts]
+    total  = sum(counts)
+    result = []
+    t      = start
+    for text, count in zip(line_texts, counts):
+        dur = (end - start) * count / total
+        result.append({
+            'text':  text,
+            'start': round(t, 3),
+            'end':   round(t + dur, 3),
+            'words': [],
+        })
+        t += dur
+    return result
+
+
+def _split_by_word_gaps(
+    words:      list[dict],
+    line_texts: list[str],
+    parent_seg: dict,
+    min_gap_ms: float = _WORD_GAP_SPLIT_MS,
+) -> list[dict]:
+    """
+    Split word tokens into lyric lines at natural inter-word pauses.
+
+    Primary timing method — replaces all character-ratio proportional splitting.
+    Timestamps come exclusively from word token start/end values; no interpolation.
+
+    Algorithm:
+      1. Compute gap = next_word.start − current_word.end for every adjacent pair
+      2. If ≥ n-1 gaps exist with gap ≥ min_gap_ms: use the n-1 largest as boundaries
+      3. Otherwise: divide words evenly by COUNT (not character ratio) — timing still
+         from word tokens
+      4. Each line: start = first_word.start, end = last_word.end
+    """
+    n = len(line_texts)
+
+    if not words:
+        return _proportional_line(parent_seg, line_texts)
+
+    if n == 1:
+        return [{
+            'text':  line_texts[0],
+            'start': round(float(words[0].get('start') or parent_seg.get('start', 0.0)), 3),
+            'end':   round(float(words[-1].get('end')   or parent_seg.get('end',   0.0)), 3),
+            'words': words,
+        }]
+
+    # ── Compute inter-word gaps ────────────────────────────────────────────────
+    gaps: list[tuple[float, int]] = []   # (gap_ms, index of word before gap)
+    for i in range(len(words) - 1):
+        w_end   = words[i].get('end')
+        w_start = words[i + 1].get('start')
+        if w_end is not None and w_start is not None:
+            gaps.append(((float(w_start) - float(w_end)) * 1000, i))
+
+    # ── Choose n-1 split points ────────────────────────────────────────────────
+    qualifying = [(g, i) for g, i in gaps if g >= min_gap_ms]
+
+    if len(qualifying) >= n - 1:
+        # Use the n-1 largest natural pauses — primary acoustic boundary signal
+        top      = sorted(qualifying, key=lambda x: -x[0])[:n - 1]
+        split_at = sorted(idx for _, idx in top)   # chronological order
+    else:
+        # No detectable pauses — divide words evenly by count, NOT character ratio
+        k        = len(words)
+        split_at = [max(0, min(k - 2, int(round((j + 1) * k / n)) - 1))
+                    for j in range(n - 1)]
+
+    # ── Build lines from word groups ───────────────────────────────────────────
+    edges  = [0] + [s + 1 for s in split_at] + [len(words)]
+    result: list[dict] = []
+
+    for i, text in enumerate(line_texts):
+        grp = words[edges[i]:edges[i + 1]]
+        if grp:
+            start_t = float(grp[0].get('start') or parent_seg.get('start', 0.0))
+            end_t   = float(grp[-1].get('end')   or parent_seg.get('end',   0.0))
+        else:
+            # Empty allocation (more lines than word tokens) — proportional fallback
+            seg_dur = max(0.001, parent_seg.get('end', 0.0) - parent_seg.get('start', 0.0))
+            start_t = parent_seg.get('start', 0.0) + i * seg_dur / n
+            end_t   = start_t + seg_dur / n
+
+        result.append({
+            'text':  text,
+            'start': round(start_t, 3),
+            'end':   round(end_t,   3),
+            'words': grp,
+        })
+
+    return result
+
+
+def _apply_vad_anchor(
+    words:     list[dict],
+    vad_start: float,
+    seg_id:    int,
+    job_log,
+) -> tuple[list[dict], float]:
+    """
+    Shift all word timestamps backward so the first word starts at vad_start.
+
+    WhisperX CTC alignment places the first word 100-2500ms after the actual
+    acoustic onset (VAD start).  This offset is pure model latency, not a real
+    gap — removing it re-anchors all lines in the segment to the true onset.
+
+    Skipped when offset >= _MAX_CTC_LAG_S: that indicates a legitimate
+    instrumental fill before singing starts, not CTC lag.
+
+    Returns (corrected_words, applied_offset_ms).  offset_ms == 0 means skipped.
+    """
+    if not words:
+        return words, 0.0
+    first_t = words[0].get('start')
+    if first_t is None:
+        return words, 0.0
+
+    offset = float(first_t) - vad_start
+    if offset <= 0:
+        return words, 0.0
+    if offset >= _MAX_CTC_LAG_S:
+        if job_log:
+            job_log.info(
+                f"[anchor] Seg {seg_id}: skip VAD anchor — "
+                f"offset={offset*1000:.0f}ms ≥ {_MAX_CTC_LAG_S*1000:.0f}ms "
+                f"(treating as instrumental fill)",
+                stage="transcribe",
+            )
+        return words, 0.0
+
+    corrected = []
+    for w in words:
+        cw = dict(w)
+        if cw.get('start') is not None:
+            cw['start'] = round(float(cw['start']) - offset, 3)
+        if cw.get('end') is not None:
+            cw['end'] = round(float(cw['end']) - offset, 3)
+        corrected.append(cw)
+
+    if job_log:
+        job_log.info(
+            f"[anchor] Seg {seg_id}: VAD anchor applied "
+            f"offset={offset*1000:.0f}ms "
+            f"(first_word {float(first_t):.3f}s → {vad_start:.3f}s)",
+            stage="transcribe",
+        )
+    return corrected, round(offset * 1000, 1)
+
+
+def _find_silence_splits(
+    audio_path: Path,
+    start:      float,
+    end:        float,
+    n_splits:   int,
+) -> list[float]:
+    """
+    Find n_splits split timestamps within [start, end] at the audio's quietest moments.
+
+    Loads the audio window, computes RMS energy in _RMS_HOP_MS windows, then picks the
+    n_splits quietest non-overlapping positions separated by at least _MIN_SPLIT_SEP.
+
+    Returns a sorted list of timestamps, or [] if the segment is too short or
+    not enough distinct silences are found.
+
+    Works on the vocals_asr.wav path (16 kHz mono) where Demucs has already
+    removed the backing track — vocal pauses are more prominent there.
+    """
+    if n_splits <= 0:
+        return []
+    if end - start < (n_splits + 1) * _MIN_SPLIT_SEP:
+        return []
+
+    try:
+        import soundfile as sf
+        import numpy as np
+
+        info     = sf.info(str(audio_path))
+        sr       = info.samplerate
+        s_frame  = int(start * sr)
+        n_frames = int((end - start) * sr)
+
+        audio, sr = sf.read(str(audio_path), start=s_frame, frames=n_frames, dtype='float32')
+        if audio.ndim > 1:
+            audio = audio.mean(axis=1)
+
+        hop   = max(1, int(_RMS_HOP_MS * sr / 1000))
+        win   = hop * 2
+        n_win = max(1, (len(audio) - win) // hop)
+        if n_win < n_splits + 2:
+            return []
+
+        rms = np.array([
+            float(np.sqrt(np.mean(audio[i * hop : i * hop + win] ** 2) + 1e-9))
+            for i in range(n_win)
+        ])
+
+        # Exclude first and last 10% to avoid segment-edge artifacts
+        margin    = max(1, n_win // 10)
+        min_sep_w = max(1, int(_MIN_SPLIT_SEP * sr / hop))
+
+        # Greedily pick n_splits quietest windows with minimum separation
+        sorted_idx = list(np.argsort(rms[margin : n_win - margin]) + margin)
+        chosen: list[int] = []
+        for idx in sorted_idx:
+            if len(chosen) >= n_splits:
+                break
+            if all(abs(idx - c) >= min_sep_w for c in chosen):
+                chosen.append(idx)
+
+        if len(chosen) < n_splits:
+            return []
+
+        def to_time(i: int) -> float:
+            return round(start + (i * hop + win // 2) / sr, 3)
+
+        return sorted(to_time(i) for i in chosen)
+
+    except Exception:
+        return []
+
+
+def _silence_split_fallback(
+    seg:        dict,
+    line_texts: list[str],
+    audio_path: Path,
+    job_log=None,
+) -> list[dict]:
+    """
+    Distribute lyric lines within a segment using silence detection.
+
+    Preferred over _proportional_line() when acoustic alignment fails: finds actual
+    quiet moments in the vocal audio rather than guessing by character count.
+    Falls back to _proportional_line() if silence detection finds no clean splits.
+    """
+    n = len(line_texts)
+    if n <= 1:
+        return _proportional_line(seg, line_texts)
+
+    start  = seg.get('start', 0.0)
+    end    = seg.get('end',   0.0)
+    splits = _find_silence_splits(audio_path, start, end, n - 1)
+
+    if len(splits) == n - 1:
+        boundaries = [start] + splits + [end]
+        if job_log:
+            job_log.info(
+                f"[align] Silence split: {n} lines in {end - start:.1f}s at {start:.1f}s"
+                f" — splits at {[round(s, 1) for s in splits]}",
+                stage="transcribe",
+            )
+        return [
+            {
+                'text':  text,
+                'start': round(boundaries[i],     3),
+                'end':   round(boundaries[i + 1], 3),
+                'words': [],
+            }
+            for i, text in enumerate(line_texts)
+        ]
+
+    # Silence detection failed — fall back to character-count proportional
+    return _proportional_line(seg, line_texts)
+
+
+def _boundary_from_chars(
+    chars:      list[dict],
+    line_texts: list[str],
+    seg_start:  float,
+    seg_end:    float,
+) -> list[dict]:
+    """
+    Use WhisperX character-level alignment to find precise lyric line starts.
+
+    The segment text was ' '.join(line_texts). WhisperX may include or exclude
+    the joining spaces in its chars output, so we detect which and adjust:
+      - With spaces:    len(chars) >= len(' '.join(line_texts))
+      - Without spaces: len(chars) >= len(''.join(line_texts))
+
+    Returns a list of line dicts (same length as line_texts), or [] to signal
+    that char data is incomplete and the caller should fall back.
+    """
+    if not chars or not line_texts:
+        return []
+
+    full_with_spaces = ' '.join(line_texts)
+    full_no_spaces   = ''.join(line_texts)
+
+    if len(chars) >= len(full_with_spaces):
+        # Spaces included — build positions with space offsets
+        positions: list[int] = []
+        pos = 0
+        for i, lt in enumerate(line_texts):
+            if i > 0:
+                pos += 1   # joining space
+            positions.append(pos)
+            pos += len(lt)
+    elif len(chars) >= len(full_no_spaces):
+        # Spaces NOT included — positions without space offsets
+        positions = [sum(len(lt) for lt in line_texts[:i]) for i in range(len(line_texts))]
+    else:
+        return []   # insufficient char data
+
+    result: list[dict] = []
+    tolerance = 2.0
+
+    for i, (lpos, text) in enumerate(zip(positions, line_texts)):
+        if lpos >= len(chars):
+            return []
+        c          = chars[lpos]
+        line_start = c.get('start')
+        if line_start is None:
+            return []
+
+        # End = start of next line's first char, or last char of this line
+        if i + 1 < len(positions):
+            next_lpos = positions[i + 1]
+            nc        = chars[next_lpos] if next_lpos < len(chars) else None
+            line_end  = float(nc['start']) if nc and nc.get('start') is not None else seg_end
+        else:
+            last_lpos = min(lpos + len(text) - 1, len(chars) - 1)
+            line_end  = float(chars[last_lpos].get('end') or seg_end)
+
+        # Reject if outside the segment window
+        if not (seg_start - tolerance <= float(line_start) <= seg_end + tolerance):
+            return []
+
+        result.append({
+            'text':  text,
+            'start': round(float(line_start), 3),
+            'end':   round(float(line_end),   3),
+            'words': [],
+        })
+
+    return result
+
+
+# ── Reconciliation constants ───────────────────────────────────────────────────
+_RECONCILE_MIN_OVERLAP = 0.30   # aligned_seg must have ≥30% overlap with rough_seg
+
+
+def _reconcile_by_overlap(
+    rough_segments: AlignedSegments,
+    aligned_segs:   AlignedSegments,
+) -> tuple[dict[int, list[dict]], list[dict]]:
+    """
+    Map each rough segment to the aligned segments that fall within its time
+    window, matching by time overlap rather than array index.
+
+    When WhisperX resegments internally (e.g. splits one 29-second window into
+    three sub-segments) this recovers the char/word data from each sub-segment
+    and assigns it to the correct rough segment rather than discarding it.
+
+    Returns ({rough_idx: [aligned_seg, ...]}, unmatched_segs).
+    Each bucket is sorted by start time.
+    """
+    mapping: dict[int, list[dict]] = {i: [] for i in range(len(rough_segments))}
+    unmatched: list[dict] = []
+
+    for aseg in aligned_segs:
+        a_start = aseg.get('start', 0.0)
+        a_end   = aseg.get('end',   0.0)
+        a_dur   = max(0.001, a_end - a_start)
+
+        best_i    = -1
+        best_frac = -1.0
+
+        for i, rseg in enumerate(rough_segments):
+            r_start = rseg.get('start', 0.0)
+            r_end   = rseg.get('end',   0.0)
+            overlap = max(0.0, min(a_end, r_end) - max(a_start, r_start))
+            frac    = overlap / a_dur
+            if frac > best_frac:
+                best_frac = frac
+                best_i    = i
+
+        if best_i >= 0:
+            mapping[best_i].append(aseg)
+        else:
+            unmatched.append(aseg)
+
+    # Sort each bucket by start time
+    for i in mapping:
+        mapping[i].sort(key=lambda s: s.get('start', 0.0))
+
+    return mapping, unmatched
+
+
+def _collect_chars(seg_list: list[dict]) -> list[dict]:
+    """Merge and sort chars from multiple aligned sub-segments."""
+    chars: list[dict] = []
+    for seg in seg_list:
+        chars.extend(seg.get('chars', []))
+    chars.sort(key=lambda c: c.get('start') or 0.0)
+    return chars
+
+
+def _collect_words(seg_list: list[dict]) -> list[dict]:
+    """Merge and sort words from multiple aligned sub-segments."""
+    words: list[dict] = []
+    for seg in seg_list:
+        words.extend(seg.get('words', []))
+    words.sort(key=lambda w: w.get('start') or 0.0)
+    return words
+
+
+def _align_whisperx_with_official_lyrics(
+    rough_segments: AlignedSegments,
+    official_lines: list[dict],
+    audio_path:     Path,
+    job_log,
+) -> tuple[AlignedSegments, AlignmentMethod]:
+    """
+    Assign precise timestamps to official lyric lines using Whisper's timing
+    windows.
+
+    Strategy:
+      1. Map lines to segments by duration (proportional, no text matching)
+      2. WhisperX acoustic alignment with char-level timestamps
+      3. Reconcile aligned output → rough segments by time overlap (not index)
+      4. Per rough segment: char → word → silence → proportional priority
+      5. Validate, bridge gaps, log timing source breakdown
+    """
+    import whisperx
+
+    device = _get_device()
+
+    if job_log:
+        job_log.info(
+            f"[align] Official lyrics alignment: "
+            f"{len(official_lines)} lines → {len(rough_segments)} windows",
+            stage="transcribe",
+        )
+
+    # ── 1. Duration-weighted segment assignment ───────────────────────────────
+    seg_to_lines = _map_lines_to_segments_by_duration(rough_segments, official_lines)
+
+    # Debug instrumentation — observability only, no effect on alignment
+    from alignment.debug import AlignmentDebugger
+    _dbg = AlignmentDebugger(len(rough_segments), len(official_lines))
+
+    # ── Collapse detection ────────────────────────────────────────────────────
+    # Warn when a segment window is too short for its assigned lines.
+    # These segments will use silence detection (not proportional distribution)
+    # in the fallback path below.
+    for i, seg in enumerate(rough_segments):
+        lines_here = seg_to_lines.get(i, [])
+        if not lines_here:
+            continue
+        dur     = seg.get('end', 0.0) - seg.get('start', 0.0)
+        dur_per = dur / len(lines_here)
+        if dur_per < _MIN_DUR_PER_LINE and job_log:
+            job_log.warning(
+                f"[align] Collapsed segment {i}: {len(lines_here)} lines in "
+                f"{dur:.2f}s ({dur_per:.2f}s/line) at {seg.get('start', 0.0):.1f}s",
+                stage="transcribe",
+            )
+
+    # ── 2. WhisperX acoustic alignment ───────────────────────────────────────
+    new_segs:     list[dict]                  = []
+    seg_line_map: list[Optional[list[str]]]   = []
+
+    for i, seg in enumerate(rough_segments):
+        lines = seg_to_lines.get(i)
+        new_segs.append({
+            'text':  ' '.join(lines) if lines else seg.get('text', ''),
+            'start': seg.get('start', 0.0),
+            'end':   seg.get('end',   0.0),
+        })
+        seg_line_map.append(lines)
+
+    try:
+        audio       = whisperx.load_audio(str(audio_path))
+        align_model, align_meta = whisperx.load_align_model(
+            language_code=WHISPER_LANGUAGE, device=device,
+        )
+        aligned      = whisperx.align(
+            new_segs, align_model, align_meta, audio, device,
+            return_char_alignments=True,
+        )
+        del align_model
+        _free_vram()
+        aligned_segs = aligned.get('segments', new_segs)
+    except Exception as exc:
+        if job_log:
+            job_log.warning(f"[align] WhisperX alignment failed, using proportional: {exc}", stage="transcribe")
+        aligned_segs = new_segs
+
+    # ── 3. Reconcile aligned segments → rough segments by time overlap ───────
+    if len(aligned_segs) != len(rough_segments):
+        if job_log:
+            job_log.info(
+                f"[align] WhisperX returned {len(aligned_segs)} segments "
+                f"(expected {len(rough_segments)}) — reconciling by time overlap "
+                f"to preserve char-level acoustic data",
+                stage="transcribe",
+            )
+        seg_map, unmatched = _reconcile_by_overlap(rough_segments, aligned_segs)
+        if unmatched and job_log:
+            job_log.warning(
+                f"[align] {len(unmatched)} aligned segment(s) fell outside all "
+                f"rough-segment windows and were discarded",
+                stage="transcribe",
+            )
+    else:
+        # 1:1 index mapping (the count-matched path)
+        seg_map   = {i: [aseg] for i, aseg in enumerate(aligned_segs)}
+        unmatched = []
+
+    # ── 4. Build per-line results ─────────────────────────────────────────────
+    timing_sources: dict[str, int] = {
+        'char_boundary': 0,
+        'word_boundary': 0,
+        'silence_split': 0,
+        'proportional':  0,
+    }
+    final: list[dict] = []
+    _anchor_offsets: list[float] = []   # per-segment applied offset (ms), 0 = skipped
+
+    for i, (orig_seg, line_texts) in enumerate(zip(rough_segments, seg_line_map)):
+        matched   = seg_map.get(i, [])
+        seg_start = orig_seg.get('start', 0.0)
+        seg_end   = orig_seg.get('end',   0.0)
+
+        if not line_texts:
+            final.extend(matched if matched else [orig_seg])
+            continue
+
+        # Collect char/word data from all aligned sub-segments for this window
+        chars = _collect_chars(matched)
+        words = _collect_words(matched)
+
+        # ── Debug: record segment baseline ───────────────────────────────────
+        _dbg.record_segment(i, seg_start, seg_end, matched, line_texts or [], chars, words)
+
+        # Use the tightest acoustic time bounds, clamped to rough ± tolerance
+        tolerance = 2.0
+        if matched:
+            eff_start = max(seg_start - tolerance, matched[0].get('start', seg_start))
+            eff_end   = min(seg_end   + tolerance, matched[-1].get('end',   seg_end))
+        else:
+            eff_start, eff_end = seg_start, seg_end
+
+        # ── VAD anchor: remove per-segment CTC lag ───────────────────────────
+        # Shifts word timestamps so the first word starts at the VAD boundary.
+        # Skipped when the offset is large enough to indicate an instrumental fill.
+        words, _anchor_ms = _apply_vad_anchor(words, seg_start, i, job_log)
+        _anchor_offsets.append(_anchor_ms)
+        anchored_start = seg_start if _anchor_ms > 0.0 else eff_start
+        eff_seg = {'start': anchored_start, 'end': eff_end, 'text': '', 'words': words}
+
+        # ── Timing priority: word-gap → char timestamps → proportional ─────────
+        # Character ratio is NEVER used for timing; only word/char timestamps.
+        candidates: list[dict] = []
+        source     = 'proportional'
+
+        if len(line_texts) > 1:
+            if words:
+                # PRIMARY: word-gap boundary detection — acoustic, no char-ratio
+                candidates = _split_by_word_gaps(words, line_texts, eff_seg)
+                source     = 'word_boundary'
+            elif chars:
+                # SECONDARY: char-level CTC timestamps (no word data available)
+                char_cands = _boundary_from_chars(chars, line_texts, seg_start, seg_end)
+                if char_cands:
+                    candidates = char_cands
+                    source     = 'char_boundary'
+                else:
+                    candidates = _proportional_line(orig_seg, line_texts)
+                    source     = 'proportional'
+            else:
+                # LAST RESORT: no acoustic data — proportional only
+                candidates = _proportional_line(orig_seg, line_texts)
+                source     = 'proportional'
+        else:
+            # Single-line segment — use aligned segment bounds
+            cand   = {**eff_seg, 'text': line_texts[0], 'words': words}
+            source = 'word_boundary' if words else ('char_boundary' if chars else 'proportional')
+            candidates = [cand]
+
+        # ── Validate: reject candidates outside the rough-segment window ────
+        valid = candidates and all(
+            seg_start - tolerance <= c.get('start', 0.0) <= seg_end + tolerance
+            for c in candidates
+            if c.get('start', 0.0) > 0
+        )
+
+        if valid:
+            for c in candidates:
+                c['_timing_source'] = source
+            final.extend(candidates)
+            timing_sources[source] += len(candidates)
+            # Debug: record each accepted line
+            counts = [max(1, _char_count(t)) for t in (line_texts or [])]
+            total_c = max(1, sum(counts))
+            total_w = max(1, len(words))
+            char_cum = 0
+            for li, (cand, cnt) in enumerate(zip(candidates, counts)):
+                char_ratio = char_cum / total_c
+                word_ratio = round(cnt / total_c * total_w / total_w, 4)
+                sil = _dbg.probe_silence(audio_path, cand.get('start', seg_start))
+                _dbg.record_line(
+                    len(final) - len(candidates) + li, cand, i,
+                    seg_start, seg_end, char_ratio, word_ratio,
+                    source, cand.get('words', []), sil,
+                )
+                char_cum += cnt
+        else:
+            if job_log:
+                job_log.warning(
+                    f"[align] Timestamps outside window [{seg_start:.1f}-{seg_end:.1f}s] "
+                    f"for '{line_texts[0][:20]}' — trying silence split",
+                    stage="transcribe",
+                )
+            silence_lines = _silence_split_fallback(orig_seg, line_texts, audio_path, job_log)
+            # Silence split succeeds if it found distinct boundaries
+            n_unique = len({c['start'] for c in silence_lines})
+            sil_src  = 'silence_split' if (n_unique > 1 or len(silence_lines) == 1) else 'proportional'
+            for c in silence_lines:
+                c['_timing_source'] = sil_src
+            final.extend(silence_lines)
+            timing_sources[sil_src] += len(silence_lines)
+            # Debug: record fallback lines
+            counts = [max(1, _char_count(t)) for t in (line_texts or [])]
+            total_c = max(1, sum(counts))
+            char_cum = 0
+            for li, (cand, cnt) in enumerate(zip(silence_lines, counts)):
+                sil = _dbg.probe_silence(audio_path, cand.get('start', seg_start))
+                _dbg.record_line(
+                    len(final) - len(silence_lines) + li, cand, i,
+                    seg_start, seg_end, char_cum / total_c, cnt / total_c,
+                    sil_src, cand.get('words', []), sil,
+                )
+                char_cum += cnt
+
+    # ── Anchor summary ────────────────────────────────────────────────────────
+    n_anchored = sum(1 for o in _anchor_offsets if o > 0)
+    if n_anchored > 0 and job_log:
+        applied = [o for o in _anchor_offsets if o > 0]
+        job_log.info(
+            f"[anchor] VAD anchor applied to {n_anchored}/{len(rough_segments)} segments, "
+            f"mean_offset={sum(applied)/len(applied):.0f}ms "
+            f"min={min(applied):.0f}ms max={max(applied):.0f}ms",
+            stage="transcribe",
+        )
+
+    # ── 5. Bridge small gaps ──────────────────────────────────────────────────
+    for i in range(len(final) - 1):
+        cur_end    = final[i].get('end',   0.0)
+        next_start = final[i + 1].get('start', 0.0)
+        if 0 < next_start - cur_end:
+            # Bridge all gaps — standard karaoke behavior: keep the previous line
+            # visible until just before the next one starts, regardless of gap size.
+            # Acoustic timestamps correctly identify instrumental sections; without
+            # bridging, those sections show as dead zones with nothing highlighted.
+            final[i]['end'] = round(next_start - 0.05, 3)
+
+    # ── 6. Summary metrics ────────────────────────────────────────────────────
+    n_total    = max(1, len(final))
+    n_acoustic = timing_sources['char_boundary'] + timing_sources['word_boundary']
+    n_prop     = timing_sources['proportional']
+    n_short    = sum(1 for ln in final
+                     if ln.get('end', 0.0) - ln.get('start', 0.0) < _MIN_DUR_PER_LINE)
+
+    if job_log:
+        job_log.info(
+            f"[align] Alignment complete: {n_total} lines | "
+            f"char={timing_sources['char_boundary']} "
+            f"word={timing_sources['word_boundary']} "
+            f"silence={timing_sources['silence_split']} "
+            f"proportional={n_prop} "
+            f"({100 * n_acoustic // n_total}% acoustic)"
+            + (f" | {n_short} short (<{_MIN_DUR_PER_LINE}s)" if n_short else ""),
+            stage="transcribe",
+        )
+        if n_prop > n_total * 0.20 and n_acoustic > 0:
+            job_log.warning(
+                f"[align] {n_prop}/{n_total} lines ({100*n_prop//n_total}%) used "
+                f"proportional fallback — char-level alignment may be incomplete",
+                stage="transcribe",
+            )
+        if n_acoustic == 0:
+            job_log.warning(
+                "[align] No acoustic boundaries found — all lines are proportional estimates",
+                stage="transcribe",
+            )
+
+    # ── Save debug report ────────────────────────────────────────────────────
+    try:
+        _dbg.save(audio_path.parent)
+    except Exception as _de:
+        logger.debug("alignment_debug.json write failed: %s", _de)
+
+    return final, "whisperx_official"
+
+
 # ── Public entry point ─────────────────────────────────────────────────────────
 
 def force_align(
-    segments:   AlignedSegments,
-    audio_path: Path,
-    progress_cb: Optional[Callable[[int], None]] = None,
+    segments:        AlignedSegments,
+    audio_path:      Path,
+    official_lyrics: Optional[list[dict]] = None,
+    progress_cb:     Optional[Callable[[int], None]] = None,
     job_log=None,
 ) -> tuple[AlignedSegments, AlignmentMethod]:
     """
     Attach word-level timestamps to segments using the best available aligner.
+    If official_lyrics are provided, uses them for acoustic forced alignment
+    instead of Whisper's garbled text, giving much more precise timestamps.
     Returns (enriched_segments, method_name).
     """
-    # If the transcriber already produced word-level timing (e.g. WhisperX or
-    # faster-whisper with word_timestamps=True), still run WhisperX alignment
-    # for improved accuracy — but skip if words already have good scores.
+    # Official lyrics path: replace Whisper text with correct lyrics and re-align
+    if official_lyrics:
+        try:
+            result, method = _align_whisperx_with_official_lyrics(
+                segments, official_lyrics, audio_path, job_log
+            )
+            if progress_cb:
+                progress_cb(100)
+            return result, method
+        except Exception as exc:
+            if job_log:
+                job_log.warning(
+                    f"[align] Official lyrics alignment failed, falling back to standard: {exc}",
+                    stage="transcribe",
+                )
+
+    # Standard path: align Whisper's own transcription
     already_aligned = all(
         seg.get("words") and
         all(w.get("score", 0) > 0.3 for w in seg["words"])
@@ -236,7 +1065,6 @@ def force_align(
             if job_log:
                 job_log.warning(f"[align] {name} failed: {exc}", stage="transcribe")
 
-    # Last resort
     result, method = _align_even(segments, job_log)
     if progress_cb:
         progress_cb(100)

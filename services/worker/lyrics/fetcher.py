@@ -14,11 +14,13 @@ from typing import Optional
 from cache import cache_dir
 from lyrics.types import LyricsResult, ProviderAttempt, VideoInfo
 from lyrics.providers.youtube_captions import YouTubeCaptionsProvider
-from lyrics.providers.description import DescriptionProvider
-from lyrics.providers.comments import CommentsProvider
-from lyrics.providers.genius import GeniusProvider
+from lyrics.providers.youtube_auto_captions import YouTubeAutoCaptionsProvider
+from lyrics.providers.utanet import UtaNetProvider
 from lyrics.providers.utaten import UtatenProvider
 from lyrics.providers.petitlyrics import PetitLyricsProvider
+from lyrics.providers.genius import GeniusProvider
+from lyrics.providers.description import DescriptionProvider
+from lyrics.providers.comments import CommentsProvider
 from lyrics.providers.manual import ManualProvider
 
 logger = logging.getLogger(__name__)
@@ -26,15 +28,17 @@ logger = logging.getLogger(__name__)
 CACHE_FILE = "lyrics_cached.json"
 
 # Provider registry — ordered by priority (ascending = tried first)
+# Accuracy-first: official captions → Japanese lyrics DBs → Genius → description/comments → auto-captions → manual
 _PROVIDERS = [
-    YouTubeCaptionsProvider(),  # priority 1 — official captions
-    # priority 2 — auto captions (second instance of same class, different mode)
-    DescriptionProvider(),      # priority 3
-    CommentsProvider(),         # priority 4
-    GeniusProvider(),           # priority 5
-    UtatenProvider(),           # priority 6
-    PetitLyricsProvider(),      # priority 7
-    ManualProvider(),           # priority 8 — stored override / last resort
+    YouTubeCaptionsProvider(),      # priority 1 — official human-authored captions
+    UtaNetProvider(),               # priority 2 — best Japanese lyrics DB
+    UtatenProvider(),               # priority 3 — Japanese lyrics DB
+    PetitLyricsProvider(),          # priority 4 — Japanese lyrics DB
+    GeniusProvider(),               # priority 5
+    DescriptionProvider(),          # priority 6
+    CommentsProvider(),             # priority 7
+    YouTubeAutoCaptionsProvider(),  # priority 8 — last resort, often inaccurate for music
+    ManualProvider(),               # priority 9 — stored override
 ]
 
 

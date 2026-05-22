@@ -17,6 +17,7 @@ export interface JobStepInfo {
   status: JobStatus;
   progress: number;
   error: string | null;
+  message?: string | null;
 }
 
 export interface JobLogEntry {

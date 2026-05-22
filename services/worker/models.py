@@ -31,6 +31,7 @@ class JobStepInfo(BaseModel):
     status:   JobStatus
     progress: int = Field(ge=0, le=100)
     error:    Optional[str] = None
+    message:  Optional[str] = None
 
 
 class Job(BaseModel):
@@ -66,6 +67,7 @@ class Job(BaseModel):
                     "status":   s.status.value,
                     "progress": s.progress,
                     "error":    s.error,
+                    "message":  s.message,
                 }
                 for s in self.steps
             ],

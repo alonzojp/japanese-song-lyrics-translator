@@ -12,6 +12,23 @@ import { VocabCard, makeWordCard } from "@/components/vocab-card";
 import type { Job, JobLogEntry, JobStepInfo, JobStatus, LyricLine, Token } from "@japanese-lyrics/shared";
 import type { ExportCard } from "@japanese-lyrics/anki";
 
+// ── YouTube IFrame API types ───────────────────────────────────────────────────
+
+interface YTPlayer {
+  playVideo(): void;
+  pauseVideo(): void;
+  getCurrentTime(): number;
+  getPlayerState(): number;
+  destroy(): void;
+}
+
+declare global {
+  interface Window {
+    YT: { Player: new (el: HTMLElement, opts: unknown) => YTPlayer; PlayerState: Record<string, number> };
+    onYouTubeIframeAPIReady: () => void;
+  }
+}
+
 // ── Types ──────────────────────────────────────────────────────────────────────
 
 interface KaraokePlayerProps {
@@ -44,7 +61,9 @@ const STEP_LABELS: Record<string, string> = {
   align:      "Align timestamps",
 };
 
-const POLL_MS = 2500;
+const POLL_MS    = 1200;
+const LEAD_IN_S  = 1.2;    // show next line N seconds before its acoustic start
+const LINGER_S   = 0.35;   // keep previous line visible for N seconds after transition
 
 // ── Step row ───────────────────────────────────────────────────────────────────
 
@@ -76,6 +95,9 @@ function StepRow({ step }: { step: JobStepInfo }) {
             <span className="text-xs text-green-600">done</span>
           )}
         </div>
+        {step.status === "processing" && step.message && (
+          <p className="text-xs text-muted-foreground">{step.message}</p>
+        )}
         {step.status === "processing" && (
           <div className="h-1 w-full overflow-hidden rounded-full bg-muted">
             <div
@@ -95,11 +117,14 @@ function StepRow({ step }: { step: JobStepInfo }) {
 // ── Log panel ──────────────────────────────────────────────────────────────────
 
 function LogPanel({ logs }: { logs: JobLogEntry[] }) {
-  const [open, setOpen] = useState(false);
-  const bottomRef       = useRef<HTMLDivElement>(null);
+  const [open, setOpen]   = useState(false);
+  const containerRef      = useRef<HTMLDivElement>(null);
 
+  // Scroll the log container itself, not the page
   useEffect(() => {
-    if (open) bottomRef.current?.scrollIntoView({ behavior: "smooth" });
+    if (open && containerRef.current) {
+      containerRef.current.scrollTop = containerRef.current.scrollHeight;
+    }
   }, [logs, open]);
 
   if (logs.length === 0) return null;
@@ -118,7 +143,10 @@ function LogPanel({ logs }: { logs: JobLogEntry[] }) {
       </button>
 
       {open && (
-        <div className="max-h-52 overflow-y-auto border-t border-border px-4 py-2 font-mono">
+        <div
+          ref={containerRef}
+          className="max-h-52 overflow-y-auto border-t border-border px-4 py-2 font-mono"
+        >
           {logs.map((entry, i) => (
             <div key={i} className="flex gap-2 py-0.5 text-xs">
               <span className="shrink-0 text-muted-foreground/60">
@@ -138,7 +166,6 @@ function LogPanel({ logs }: { logs: JobLogEntry[] }) {
               </span>
             </div>
           ))}
-          <div ref={bottomRef} />
         </div>
       )}
     </div>
@@ -196,10 +223,23 @@ export function KaraokePlayer({
   const [jobStatus, setJobStatus]   = useState<JobStatus | null>(initialStatus as JobStatus | null);
   const [job, setJob]               = useState<Job | null>(null);
   const [lyrics, setLyrics]         = useState<LyricLine[]>(initialLyrics);
-  const [isPlaying, setIsPlaying]   = useState(false);
-  const [currentTime]               = useState(0);
-  const [submitError, setSubmitError] = useState<string | null>(null);
-  const pollRef                     = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const [isPlaying, setIsPlaying]       = useState(false);
+  const [currentTime, setCurrentTime]   = useState(0);
+  const [submitError, setSubmitError]   = useState<string | null>(null);
+  const [isSyncingLyrics, setIsSyncing]         = useState(false);
+  const [isFetchingLyrics, setIsFetchingLyrics] = useState(false);
+  const [fetchLyricsError, setFetchLyricsError] = useState<string | null>(null);
+  const [isPastingLyrics, setIsPasting]         = useState(false);
+  const [pasteText, setPasteText]       = useState("");
+  const [pasteError, setPasteError]     = useState<string | null>(null);
+  const [isPasteLoading, setIsPasteLoading] = useState(false);
+  const pollRef                         = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  // ── YouTube player refs ───────────────────────────────────────────────────────
+  const ytPlayerRef       = useRef<YTPlayer | null>(null);
+  const playerContainerRef = useRef<HTMLDivElement>(null);
+  const timeIntervalRef   = useRef<ReturnType<typeof setInterval> | null>(null);
+  const activeLineRef     = useRef<HTMLDivElement | null>(null);
 
   // ── Vocab / selection state ───────────────────────────────────────────────────
   const [vocabState, setVocabState]         = useState<VocabState | null>(null);
@@ -210,8 +250,26 @@ export function KaraokePlayer({
   const [analyzeError, setAnalyzeError]     = useState<string | null>(null);
 
   // ── Derived ───────────────────────────────────────────────────────────────────
-  const hasTokens   = lyrics.some((l) => l.tokens && l.tokens.length > 0);
-  const activeLine  = lyrics.find((l) => currentTime >= l.startTime && currentTime <= l.endTime);
+  const hasTokens  = lyrics.some((l) => l.tokens && l.tokens.length > 0);
+
+  // Active line: the line whose acoustic window contains currentTime.
+  const activeLine = lyrics.find((l) => currentTime >= l.startTime && currentTime <= l.endTime);
+  const activeIdx  = activeLine ? lyrics.findIndex((l) => l.id === activeLine.id) : -1;
+
+  // Incoming line: the next line, shown early to give the learner a reading head-start.
+  const incomingLine: LyricLine | null =
+    activeIdx >= 0 && activeIdx + 1 < lyrics.length &&
+    currentTime >= lyrics[activeIdx + 1].startTime - LEAD_IN_S
+      ? lyrics[activeIdx + 1]
+      : null;
+
+  // Lingering line: the previous line, briefly kept visible after a transition.
+  const lingeringLine: LyricLine | null =
+    activeIdx > 0 && activeLine &&
+    currentTime < activeLine.startTime + LINGER_S
+      ? lyrics[activeIdx - 1]
+      : null;
+
   const isActive    = jobStatus === "queued" || jobStatus === "processing";
   const isDone      = jobStatus === "completed";
   const hasFailed   = jobStatus === "failed";
@@ -221,17 +279,25 @@ export function KaraokePlayer({
   // ── Job polling ───────────────────────────────────────────────────────────────
 
   const reloadLyrics = useCallback(async () => {
-    const res = await fetch(`/api/songs/${songId}/lyrics`);
-    if (res.ok) {
-      const { lines } = (await res.json()) as { lines: LyricLine[] };
-      setLyrics(lines);
+    setIsSyncing(true);
+    try {
+      const res = await fetch(`/api/songs/${songId}/lyrics`);
+      if (res.ok) {
+        const { lines } = (await res.json()) as { lines: LyricLine[] };
+        setLyrics(lines);
+      }
+    } finally {
+      setIsSyncing(false);
     }
   }, [songId]);
 
   const poll = useCallback(async (id: string) => {
     try {
       const res  = await fetch(`/api/jobs/${id}`);
-      if (!res.ok) return;
+      if (!res.ok) {
+        pollRef.current = setTimeout(() => poll(id), POLL_MS);
+        return;
+      }
       const data = (await res.json()) as Job;
       setJob(data);
       setJobStatus(data.status);
@@ -250,6 +316,70 @@ export function KaraokePlayer({
     if (jobId && (jobStatus === "processing" || jobStatus === "queued")) poll(jobId);
     return () => { if (pollRef.current) clearTimeout(pollRef.current); };
   }, [jobId, jobStatus, poll]);
+
+  // If job is already completed but lyrics weren't saved (polling missed the finish),
+  // sync automatically on mount so the user never has to click anything.
+  useEffect(() => {
+    if (initialJobId && initialStatus === "completed" && initialLyrics.length === 0) {
+      fetch(`/api/jobs/${initialJobId}`)
+        .then((r) => r.ok ? reloadLyrics() : null)
+        .catch(() => null);
+    }
+  }, [initialJobId, initialStatus, initialLyrics.length, reloadLyrics]);
+
+  // ── YouTube IFrame API ────────────────────────────────────────────────────────
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+
+    const startInterval = () => {
+      if (timeIntervalRef.current) clearInterval(timeIntervalRef.current);
+      timeIntervalRef.current = setInterval(() => {
+        if (ytPlayerRef.current) setCurrentTime(ytPlayerRef.current.getCurrentTime());
+      }, 100);
+    };
+
+    const stopInterval = () => {
+      if (timeIntervalRef.current) { clearInterval(timeIntervalRef.current); timeIntervalRef.current = null; }
+    };
+
+    const initPlayer = () => {
+      if (!playerContainerRef.current || !window.YT?.Player) return;
+      ytPlayerRef.current = new window.YT.Player(playerContainerRef.current, {
+        videoId: youtubeId,
+        playerVars: { enablejsapi: 1, origin: window.location.origin },
+        events: {
+          onStateChange: (e: { data: number }) => {
+            if (e.data === 1) { setIsPlaying(true);  startInterval(); }
+            else              { setIsPlaying(false); stopInterval();  }
+          },
+        },
+      });
+    };
+
+    if (window.YT?.Player) {
+      initPlayer();
+    } else {
+      window.onYouTubeIframeAPIReady = initPlayer;
+      if (!document.querySelector('script[src*="youtube.com/iframe_api"]')) {
+        const tag = document.createElement("script");
+        tag.src = "https://www.youtube.com/iframe_api";
+        document.head.appendChild(tag);
+      }
+    }
+
+    return () => {
+      stopInterval();
+      ytPlayerRef.current?.destroy();
+      ytPlayerRef.current = null;
+    };
+  }, [youtubeId]);
+
+  // ── Auto-scroll active lyric into view ────────────────────────────────────────
+
+  useEffect(() => {
+    activeLineRef.current?.scrollIntoView({ behavior: "smooth", block: "nearest" });
+  }, [activeLine?.id]);
 
   // ── Submit processing job ─────────────────────────────────────────────────────
 
@@ -286,6 +416,60 @@ export function KaraokePlayer({
       setAnalyzeError(err instanceof Error ? err.message : "Analysis failed");
     } finally {
       setIsAnalyzing(false);
+    }
+  }
+
+  // ── Re-fetch lyrics from provider chain ──────────────────────────────────────
+
+  async function handleFetchLyrics() {
+    setIsFetchingLyrics(true);
+    setFetchLyricsError(null);
+    try {
+      const res = await fetch("/api/lyrics", {
+        method:  "POST",
+        headers: { "Content-Type": "application/json" },
+        body:    JSON.stringify({
+          youtubeId,
+          youtubeUrl: `https://www.youtube.com/watch?v=${youtubeId}`,
+          songId,
+          force: true,
+        }),
+      });
+      const data = (await res.json()) as { lines?: unknown[]; error?: string };
+      if (!res.ok) throw new Error(data.error ?? "Failed to fetch lyrics");
+      if ((data.lines?.length ?? 0) > 0) {
+        await reloadLyrics();
+      } else {
+        setFetchLyricsError("No lyrics found from any provider");
+      }
+    } catch (err) {
+      setFetchLyricsError(err instanceof Error ? err.message : "Something went wrong");
+    } finally {
+      setIsFetchingLyrics(false);
+    }
+  }
+
+  // ── Paste official lyrics ─────────────────────────────────────────────────────
+
+  async function handlePasteLyrics() {
+    if (!pasteText.trim()) return;
+    setIsPasteLoading(true);
+    setPasteError(null);
+    try {
+      const res = await fetch(`/api/songs/${songId}/lyrics`, {
+        method:  "POST",
+        headers: { "Content-Type": "application/json" },
+        body:    JSON.stringify({ text: pasteText }),
+      });
+      const data = (await res.json()) as { lines?: LyricLine[]; error?: string };
+      if (!res.ok) throw new Error(data.error ?? "Failed to sync lyrics");
+      setLyrics(data.lines ?? []);
+      setIsPasting(false);
+      setPasteText("");
+    } catch (err) {
+      setPasteError(err instanceof Error ? err.message : "Something went wrong");
+    } finally {
+      setIsPasteLoading(false);
     }
   }
 
@@ -329,15 +513,9 @@ export function KaraokePlayer({
   return (
     <div className="flex flex-col gap-6">
 
-      {/* YouTube embed */}
+      {/* YouTube embed — div replaced by YT.Player iframe */}
       <div className="relative aspect-video w-full overflow-hidden rounded-xl bg-muted">
-        <iframe
-          src={`https://www.youtube.com/embed/${youtubeId}?enablejsapi=1`}
-          title={title ?? "YouTube video"}
-          className="absolute inset-0 h-full w-full"
-          allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture"
-          allowFullScreen
-        />
+        <div ref={playerContainerRef} className="absolute inset-0 h-full w-full" />
       </div>
 
       {/* Song info */}
@@ -346,7 +524,7 @@ export function KaraokePlayer({
         {artist && <p className="text-muted-foreground">{artist}</p>}
       </div>
 
-      {/* Processing panel */}
+      {/* Processing / status panel */}
       {!isDone && (
         <Card>
           <CardHeader className="pb-3">
@@ -355,9 +533,7 @@ export function KaraokePlayer({
               {isActive ? (
                 <span className="flex items-center gap-2">
                   Processing…
-                  <span className="text-sm font-normal text-muted-foreground">
-                    {overallPct}%
-                  </span>
+                  <span className="text-sm font-normal text-muted-foreground">{overallPct}%</span>
                 </span>
               ) : "Process Lyrics"}
             </CardTitle>
@@ -375,9 +551,7 @@ export function KaraokePlayer({
             {isActive && job ? (
               <>
                 <div className="space-y-3">
-                  {job.steps.map((step) => (
-                    <StepRow key={step.name} step={step} />
-                  ))}
+                  {job.steps.map((step) => <StepRow key={step.name} step={step} />)}
                 </div>
                 <LogPanel logs={logs} />
               </>
@@ -387,19 +561,14 @@ export function KaraokePlayer({
                   {job?.error ?? "Processing failed — unknown error"}
                 </p>
                 <LogPanel logs={logs} />
-                <Button onClick={submitJob} variant="outline" size="sm">
-                  Retry
-                </Button>
+                <Button onClick={submitJob} variant="outline" size="sm">Retry</Button>
               </div>
             ) : (
               <div className="space-y-3">
                 <p className="text-sm text-muted-foreground">
-                  Extract lyrics using local Whisper + WhisperX forced alignment.
-                  Audio is cached — re-submitting the same video is instant.
+                  Extract lyrics using Whisper AI. Audio is cached — re-submitting the same video is instant.
                 </p>
-                {submitError && (
-                  <p className="text-sm text-destructive">{submitError}</p>
-                )}
+                {submitError && <p className="text-sm text-destructive">{submitError}</p>}
                 <Button onClick={submitJob} className="gap-2">
                   <Zap className="h-4 w-4" />
                   Start Processing
@@ -410,6 +579,32 @@ export function KaraokePlayer({
         </Card>
       )}
 
+      {/* Re-fetch lyrics (job done but no lyrics stored) */}
+      {lyrics.length === 0 && !isActive && (
+        <Card>
+          <CardContent className="pt-6 space-y-3">
+            <p className="text-sm text-muted-foreground">
+              No lyrics found. Try fetching from Japanese lyrics databases (UtaNet, Utaten, PetitLyrics).
+            </p>
+            {fetchLyricsError && <p className="text-sm text-destructive">{fetchLyricsError}</p>}
+            <Button onClick={handleFetchLyrics} disabled={isFetchingLyrics} className="gap-2">
+              {isFetchingLyrics
+                ? <><Loader2 className="h-4 w-4 animate-spin" />Fetching…</>
+                : <><Zap className="h-4 w-4" />Fetch lyrics</>
+              }
+            </Button>
+          </CardContent>
+        </Card>
+      )}
+
+      {/* Syncing indicator */}
+      {isSyncingLyrics && (
+        <div className="flex items-center gap-2 rounded-lg border px-4 py-3 text-sm text-muted-foreground">
+          <Loader2 className="h-4 w-4 animate-spin text-primary" />
+          Loading lyrics…
+        </div>
+      )}
+
       {/* Lyrics display */}
       {lyrics.length > 0 && (
         <Card>
@@ -418,11 +613,34 @@ export function KaraokePlayer({
               <span>Lyrics</span>
 
               <div className="flex items-center gap-2">
+                {/* Paste official lyrics */}
+                {isDone && (
+                  <Button
+                    variant="ghost" size="sm"
+                    onClick={() => setIsPasting((p) => !p)}
+                    className="gap-1.5 text-muted-foreground"
+                  >
+                    <BookOpen className="h-3.5 w-3.5" />
+                    {isPastingLyrics ? "Cancel" : "Paste lyrics"}
+                  </Button>
+                )}
+
+                {/* Reprocess */}
+                {isDone && (
+                  <Button variant="ghost" size="sm" onClick={submitJob} className="gap-1.5 text-muted-foreground">
+                    <Zap className="h-3.5 w-3.5" />
+                    Reprocess
+                  </Button>
+                )}
+
                 {/* Play/pause toggle */}
                 <Button
                   variant="ghost"
                   size="sm"
-                  onClick={() => setIsPlaying((p) => !p)}
+                  onClick={() => {
+                    if (isPlaying) ytPlayerRef.current?.pauseVideo();
+                    else           ytPlayerRef.current?.playVideo();
+                  }}
                   className="gap-1.5"
                 >
                   {isPlaying ? <Pause className="h-4 w-4" /> : <Play className="h-4 w-4" />}
@@ -475,40 +693,82 @@ export function KaraokePlayer({
             )}
           </CardHeader>
 
+          {isPastingLyrics && (
+            <div className="border-t px-6 py-4 space-y-3">
+              <p className="text-xs text-muted-foreground">
+                Paste the official lyrics below. The app will use AI alignment to sync them to the audio timestamps.
+              </p>
+              <textarea
+                value={pasteText}
+                onChange={(e) => setPasteText(e.target.value)}
+                placeholder={"Paste Japanese lyrics here…\n一行目\n二行目\n…"}
+                className="w-full rounded-md border bg-background px-3 py-2 text-sm font-japanese leading-relaxed outline-none focus:ring-2 focus:ring-primary/40 min-h-[160px] resize-y"
+                disabled={isPasteLoading}
+              />
+              {pasteError && <p className="text-xs text-destructive">{pasteError}</p>}
+              <Button
+                onClick={handlePasteLyrics}
+                disabled={isPasteLoading || !pasteText.trim()}
+                size="sm"
+                className="gap-2"
+              >
+                {isPasteLoading
+                  ? <><Loader2 className="h-3.5 w-3.5 animate-spin" />Syncing timestamps…</>
+                  : <><Zap className="h-3.5 w-3.5" />Sync lyrics</>
+                }
+              </Button>
+            </div>
+          )}
+
           <CardContent>
             <div className="space-y-1">
-              {lyrics.map((line) => (
-                <div
-                  key={line.id}
-                  className={`rounded-lg px-4 py-3 transition-all duration-300 ${
-                    activeLine?.id === line.id
-                      ? "bg-primary/10"
-                      : "hover:bg-muted"
-                  }`}
-                >
-                  {line.tokens && line.tokens.length > 0 ? (
-                    <p className="font-japanese text-lg leading-[2.4]">
-                      {line.tokens.map((token, ti) => {
-                        const selKey     = `${line.id}-${ti}`;
-                        const isSelected = selectedItems.some((s) => s.key === selKey);
-                        return (
-                          <TokenSpan
-                            key={ti}
-                            token={token}
-                            isSelected={isSelected}
-                            isHighlighted={activeLine?.id === line.id}
-                            onClick={() => handleTokenClick(token, ti, line)}
-                          />
-                        );
-                      })}
-                    </p>
-                  ) : (
-                    <p className="font-japanese text-lg leading-loose text-foreground/70">
-                      {line.text}
-                    </p>
-                  )}
-                </div>
-              ))}
+              {lyrics.map((line) => {
+                const isCurrentLine  = activeLine?.id   === line.id;
+                const isNextLine     = incomingLine?.id === line.id;
+                const isPreviousLine = lingeringLine?.id === line.id;
+
+                return (
+                  <div
+                    key={line.id}
+                    ref={isCurrentLine ? activeLineRef : null}
+                    className={`rounded-lg px-4 py-3 transition-all duration-300 ${
+                      isCurrentLine
+                        ? "bg-primary/20 ring-1 ring-primary/30"
+                        : isNextLine
+                        ? "bg-primary/10 ring-1 ring-primary/15 opacity-75"
+                        : isPreviousLine
+                        ? "bg-primary/8 opacity-40"
+                        : "hover:bg-muted"
+                    }`}
+                  >
+                    {line.tokens && line.tokens.length > 0 ? (
+                      <p className="font-japanese text-lg leading-[2.4]">
+                        {line.tokens.map((token, ti) => {
+                          const selKey     = `${line.id}-${ti}`;
+                          const isSelected = selectedItems.some((s) => s.key === selKey);
+                          return (
+                            <TokenSpan
+                              key={ti}
+                              token={token}
+                              isSelected={isSelected}
+                              isHighlighted={isCurrentLine}
+                              onClick={() => handleTokenClick(token, ti, line)}
+                            />
+                          );
+                        })}
+                      </p>
+                    ) : (
+                      <p className={`font-japanese text-lg leading-loose ${
+                        isCurrentLine ? "text-foreground" :
+                        isNextLine    ? "text-foreground/70" :
+                        "text-foreground/70"
+                      }`}>
+                        {line.text}
+                      </p>
+                    )}
+                  </div>
+                );
+              })}
             </div>
           </CardContent>
         </Card>

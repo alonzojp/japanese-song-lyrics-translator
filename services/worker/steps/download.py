@@ -39,14 +39,25 @@ ProgressCallback = Optional[Callable[[int], None]]
 
 # ── yt-dlp download ────────────────────────────────────────────────────────────
 
-def _ydl_opts(output_dir: Path, progress_cb: ProgressCallback) -> dict:
+def _ydl_opts(output_dir: Path, progress_cb: ProgressCallback, message_cb=None) -> dict:
     def _hook(d: dict) -> None:
-        if progress_cb and d.get("status") == "downloading":
-            total = d.get("total_bytes") or d.get("total_bytes_estimate") or 1
+        if d.get("status") == "downloading":
+            total = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
             done  = d.get("downloaded_bytes", 0)
-            progress_cb(int(done / total * 45))  # 0–45 %
-        elif d.get("status") == "finished" and progress_cb:
-            progress_cb(50)
+            if progress_cb:
+                progress_cb(int(done / max(total, 1) * 45))
+            if message_cb:
+                done_mb = done / 1_048_576
+                if total:
+                    total_mb = total / 1_048_576
+                    message_cb(f"Downloading ({done_mb:.1f} / {total_mb:.1f} MB)")
+                else:
+                    message_cb(f"Downloading ({done_mb:.1f} MB)")
+        elif d.get("status") == "finished":
+            if progress_cb:
+                progress_cb(50)
+            if message_cb:
+                message_cb("Converting to WAV…")
 
     return {
         # Best audio; prefer opus/m4a/webm (smaller than wav)
@@ -133,6 +144,7 @@ def download_audio(
     youtube_id:   str,
     output_dir:   Path,
     progress_cb:  ProgressCallback = None,
+    message_cb=None,
     job_log=None,
 ) -> tuple[Path, dict]:
     """
@@ -165,7 +177,9 @@ def download_audio(
 
     if raw_path is None:
         log(f"Downloading audio for {youtube_id} …")
-        opts = _ydl_opts(output_dir, progress_cb)
+        if message_cb:
+            message_cb("Fetching from YouTube…")
+        opts = _ydl_opts(output_dir, progress_cb, message_cb)
         with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(youtube_url, download=True) or {}
         raw_path = _find_raw(output_dir)

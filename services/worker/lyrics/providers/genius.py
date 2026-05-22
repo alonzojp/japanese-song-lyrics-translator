@@ -1,13 +1,14 @@
 """
-Provider 5 — Genius web scraping.
+Provider 5 — Genius lyrics.
 
-Searches genius.com for the song, then scrapes the lyrics page.
-No API key required — uses public HTML endpoints.
+Uses the official Genius API for search (if GENIUS_ACCESS_TOKEN is set),
+then scrapes the lyrics page (Genius API doesn't return full lyrics).
 Priority 5, confidence 0.85.
 """
 from __future__ import annotations
 
 import logging
+import os
 import re
 from typing import Optional
 from urllib.parse import quote_plus
@@ -22,6 +23,7 @@ from lyrics.providers.base import LyricsProvider
 
 logger = logging.getLogger(__name__)
 
+GENIUS_API_SEARCH = "https://api.genius.com/search"
 GENIUS_SEARCH_URL = "https://genius.com/search?q={query}"
 GENIUS_BASE       = "https://genius.com"
 _TIMEOUT          = 10.0
@@ -31,6 +33,7 @@ _HEADERS          = {
 }
 _MIN_LINES    = 4
 _MIN_JA_RATIO = 0.30
+_GENIUS_TOKEN = os.getenv("GENIUS_ACCESS_TOKEN", "")
 
 
 class GeniusProvider(LyricsProvider):
@@ -89,6 +92,25 @@ async def _search(
     query: str,
     video: VideoInfo,
 ) -> Optional[str]:
+    # Prefer API search when token is available — much more reliable
+    if _GENIUS_TOKEN:
+        try:
+            resp = await client.get(
+                GENIUS_API_SEARCH,
+                params={"q": query},
+                headers={**_HEADERS, "Authorization": f"Bearer {_GENIUS_TOKEN}"},
+            )
+            resp.raise_for_status()
+            hits = resp.json().get("response", {}).get("hits", [])
+            for hit in hits:
+                result = hit.get("result", {})
+                url = result.get("url", "")
+                if url:
+                    return url
+        except Exception as exc:
+            logger.debug("Genius API search failed, falling back to scrape: %s", exc)
+
+    # Fallback: scrape the search page
     url = GENIUS_SEARCH_URL.format(query=quote_plus(query))
     try:
         resp = await client.get(url)
@@ -98,14 +120,11 @@ async def _search(
         return None
 
     soup = BeautifulSoup(resp.text, "lxml")
-
-    # Genius search results: look for hits with Japanese in the title/artist
     for link in soup.select("a[href*='/lyrics/'], a[href*='-lyrics']"):
         href = link.get("href", "")
         if not href.startswith("/") and not href.startswith(GENIUS_BASE):
             continue
         full = href if href.startswith("http") else GENIUS_BASE + href
-        # Prefer links that look like song pages (contain artist slug)
         if "/lyrics/" in full or full.count("-") >= 2:
             return full
 

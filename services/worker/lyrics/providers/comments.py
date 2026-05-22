@@ -27,7 +27,7 @@ _MIN_CHARS    = 150
 
 class CommentsProvider(LyricsProvider):
     name     = "comments"
-    priority = 4
+    priority = 7
 
     async def fetch(self, video: VideoInfo) -> Optional[LyricsResult]:
         comments = await _fetch_top_comments(video.youtube_url)

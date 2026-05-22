@@ -29,18 +29,24 @@ _MIN_LINES    = 4
 
 class UtatenProvider(LyricsProvider):
     name     = "utaten"
-    priority = 6
+    priority = 3
 
     async def fetch(self, video: VideoInfo) -> Optional[LyricsResult]:
-        query = video.search_query
-        if not query:
+        # Try full query then title-only fallback
+        for query in dict.fromkeys([video.search_query, video.title_only_query]):
+            if not query:
+                continue
+            async with httpx.AsyncClient(headers=_HEADERS, timeout=_TIMEOUT, follow_redirects=True) as client:
+                song_url = await _search(client, query)
+                if not song_url:
+                    continue
+                raw_text, page_url = await _scrape(client, song_url)
+            if raw_text:
+                break
+        else:
             return None
 
-        async with httpx.AsyncClient(headers=_HEADERS, timeout=_TIMEOUT, follow_redirects=True) as client:
-            song_url = await _search(client, query)
-            if not song_url:
-                return None
-            raw_text, page_url = await _scrape(client, song_url)
+        query = video.search_query  # keep for metadata
 
         if not raw_text:
             return None

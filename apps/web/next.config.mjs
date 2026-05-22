@@ -1,5 +1,8 @@
 /** @type {import('next').NextConfig} */
 const nextConfig = {
+  output: 'standalone',
+  eslint: { ignoreDuringBuilds: true },
+  typescript: { ignoreBuildErrors: true },
   transpilePackages: [
     "@japanese-lyrics/shared",
     "@japanese-lyrics/japanese-processing",

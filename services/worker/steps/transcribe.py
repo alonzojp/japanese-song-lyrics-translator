@@ -35,10 +35,12 @@ ProgressCallback = Optional[Callable[[int], None]]
 
 
 def run_transcription(
-    audio_path:  Path,
-    output_dir:  Path,
-    youtube_id:  str,
-    progress_cb: ProgressCallback = None,
+    audio_path:      Path,
+    output_dir:      Path,
+    youtube_id:      str,
+    official_lyrics: Optional[list[dict]] = None,
+    progress_cb:     ProgressCallback = None,
+    message_cb=None,
     job_log=None,
 ) -> tuple[list[dict], str, str]:
     """
@@ -72,6 +74,8 @@ def run_transcription(
 
     # ── 3a: Audio prep (0–20 %) ────────────────────────────────────────────────
     log("Preparing audio for ASR …")
+    if message_cb:
+        message_cb("Preparing audio for transcription…")
     asr_path = prepare_audio_for_asr(
         audio_path,
         output_dir,
@@ -86,29 +90,49 @@ def run_transcription(
         backend = "cached"
     else:
         log("Transcribing …")
+        if message_cb:
+            message_cb("Loading Whisper model…")
 
         def tx_cb(pct: int) -> None:
             if progress_cb:
                 progress_cb(20 + int(0.50 * pct))
 
-        raw_segments, backend = transcribe(asr_path, progress_cb=tx_cb, job_log=job_log)
+        raw_segments, backend = transcribe(asr_path, progress_cb=tx_cb, message_cb=message_cb, job_log=job_log)
         log(f"Transcription complete: {len(raw_segments)} segments via {backend}")
         save_transcript(output_dir, raw_segments, backend)
 
     # ── 3c: Forced alignment (70–100 %) ────────────────────────────────────────
     loaded_aligned = load_aligned_words(output_dir)
+
+    # If official lyrics are available but previous alignment didn't use them,
+    # re-run alignment with official lyrics for much better timing accuracy.
+    if loaded_aligned and official_lyrics:
+        _, cached_method = loaded_aligned
+        if cached_method != "whisperx_official":
+            log("Official lyrics available — re-running alignment for precise timestamps")
+            loaded_aligned = None  # invalidate cache
+
     if loaded_aligned:
         aligned_segs, method = loaded_aligned
         log(f"Loaded cached alignment ({method})")
     else:
-        log("Running forced alignment …")
+        if official_lyrics:
+            log(f"Running forced alignment with {len(official_lyrics)} official lyrics lines…")
+            if message_cb:
+                message_cb(f"Aligning {len(official_lyrics)} official lyrics to audio…")
+        else:
+            log("Running forced alignment …")
+            if message_cb:
+                message_cb("Aligning words to audio…")
 
         def al_cb(pct: int) -> None:
             if progress_cb:
                 progress_cb(70 + int(0.30 * pct))
 
         aligned_segs, method = force_align(
-            raw_segments, asr_path, progress_cb=al_cb, job_log=job_log
+            raw_segments, asr_path,
+            official_lyrics=official_lyrics,
+            progress_cb=al_cb, job_log=job_log,
         )
         log(f"Alignment complete via {method}: {len(aligned_segs)} segments")
         save_aligned_words(output_dir, aligned_segs, method)

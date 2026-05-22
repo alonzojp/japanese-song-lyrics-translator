@@ -58,6 +58,7 @@ def _transcribe_whisperx(
     audio_path: Path,
     progress_cb: Optional[Callable[[int], None]],
     job_log,
+    message_cb=None,
 ) -> list[dict]:
     import whisperx
 
@@ -80,8 +81,12 @@ def _transcribe_whisperx(
             )
             if progress_cb:
                 progress_cb(25)
+            if message_cb:
+                message_cb(f"Transcribing audio with WhisperX ({WHISPER_MODEL})…")
 
             audio  = whisperx.load_audio(str(audio_path))
+            # WhisperX's FasterWhisperPipeline only exposes a subset of params —
+            # no_speech_threshold etc. are not forwarded. Pass what it accepts.
             result = model.transcribe(
                 audio,
                 language=WHISPER_LANGUAGE,
@@ -123,6 +128,7 @@ def _transcribe_faster_whisper(
     audio_path: Path,
     progress_cb: Optional[Callable[[int], None]],
     job_log,
+    message_cb=None,
 ) -> list[dict]:
     from faster_whisper import WhisperModel
 
@@ -140,15 +146,30 @@ def _transcribe_faster_whisper(
             model = WhisperModel(WHISPER_MODEL, device=device, compute_type=compute_type)
             if progress_cb:
                 progress_cb(25)
+            if message_cb:
+                message_cb(f"Transcribing audio with faster-whisper ({WHISPER_MODEL})…")
 
-            segments_gen, _info = model.transcribe(
+            segments_gen, info = model.transcribe(
                 str(audio_path),
                 language=WHISPER_LANGUAGE,
                 word_timestamps=True,
                 vad_filter=True,
+                vad_parameters={
+                    "threshold": 0.3,
+                    "min_speech_duration_ms": 100,
+                    "min_silence_duration_ms": 500,
+                    "speech_pad_ms": 400,
+                },
+                # Suppress hallucination loops (common with Vocaloid/synthetic vocals)
+                no_speech_threshold=0.6,
+                condition_on_previous_text=False,
+                compression_ratio_threshold=2.0,
+                temperature=0.0,
+                repetition_penalty=1.1,
             )
 
             segments: list[dict] = []
+            total_duration = max(info.duration or 1.0, 1.0)
             for seg in segments_gen:
                 words = [
                     {"word": w.word, "start": w.start, "end": w.end, "score": w.probability}
@@ -160,10 +181,14 @@ def _transcribe_faster_whisper(
                     "text":  seg.text.strip(),
                     "words": words,
                 })
+                if progress_cb:
+                    # Scale 25→95 based on how far through the audio we are
+                    pct = 25 + int((seg.end / total_duration) * 70)
+                    progress_cb(min(pct, 95))
 
             log(f"[faster-whisper] transcribed {len(segments)} segments")
             if progress_cb:
-                progress_cb(70)
+                progress_cb(95)
             return segments
 
         except Exception as exc:
@@ -185,6 +210,7 @@ def _transcribe_openai_whisper(
     audio_path: Path,
     progress_cb: Optional[Callable[[int], None]],
     job_log,
+    message_cb=None,
 ) -> list[dict]:
     import whisper
 
@@ -202,12 +228,19 @@ def _transcribe_openai_whisper(
             model  = whisper.load_model(WHISPER_MODEL, device=device)
             if progress_cb:
                 progress_cb(25)
+            if message_cb:
+                message_cb(f"Transcribing audio with Whisper ({WHISPER_MODEL})…")
 
             result = model.transcribe(
                 str(audio_path),
                 language=WHISPER_LANGUAGE,
                 word_timestamps=True,
                 verbose=False,
+                # Suppress hallucination loops (common with Vocaloid/synthetic vocals)
+                no_speech_threshold=0.6,
+                condition_on_previous_text=False,
+                compression_ratio_threshold=2.0,
+                temperature=(0.0, 0.2, 0.4, 0.6, 0.8, 1.0),
             )
             raw_segs = result.get("segments", [])
             segments = []
@@ -242,9 +275,36 @@ def _transcribe_openai_whisper(
 
 # ── Public entry point ─────────────────────────────────────────────────────────
 
+def _filter_hallucinations(segments: list[dict], job_log=None) -> list[dict]:
+    """Remove segments that are clearly hallucinated (same text repeated many times)."""
+    if not segments:
+        return segments
+
+    from collections import Counter
+    texts = [s.get("text", "").strip() for s in segments if s.get("text", "").strip()]
+    if not texts:
+        return segments
+
+    counts = Counter(texts)
+    # If any single line makes up >40% of all segments, it's a hallucination loop
+    threshold = max(3, len(texts) * 0.4)
+    hallucinated = {text for text, count in counts.items() if count >= threshold}
+
+    if hallucinated:
+        if job_log:
+            job_log.warning(
+                f"Filtered hallucinated segments: {hallucinated}",
+                stage="transcribe",
+            )
+        segments = [s for s in segments if s.get("text", "").strip() not in hallucinated]
+
+    return segments
+
+
 def transcribe(
     audio_path:  Path,
     progress_cb: Optional[Callable[[int], None]] = None,
+    message_cb=None,
     job_log=None,
 ) -> tuple[list[dict], str]:
     """
@@ -263,11 +323,13 @@ def transcribe(
 
     for name, fn in backends:
         try:
-            segments = fn(audio_path, progress_cb, job_log)
+            segments = fn(audio_path, progress_cb, job_log, message_cb)
+            segments = _filter_hallucinations(segments, job_log)
             return segments, name
-        except ImportError:
+        except ImportError as ie:
             if job_log:
-                job_log.info(f"{name} not installed, trying next backend", stage="transcribe")
+                job_log.info(f"{name} not installed ({ie}), trying next backend", stage="transcribe")
+            logger.warning("%s import failed: %s", name, ie)
         except Exception as exc:
             last_exc = exc
             if job_log:

@@ -27,6 +27,7 @@ def separate_vocals(
     output_dir:  Path,
     youtube_id:  str,
     progress_cb: ProgressCallback = None,
+    message_cb=None,
     job_log=None,
 ) -> Path:
     """
@@ -53,6 +54,8 @@ def separate_vocals(
         return vocals_path
 
     log(f"Separating vocals with Demucs model={DEMUCS_MODEL} …")
+    if message_cb:
+        message_cb(f"Running {DEMUCS_MODEL} — this may take a few minutes…")
     if progress_cb:
         progress_cb(5)
 
@@ -60,7 +63,7 @@ def separate_vocals(
     cmd = [
         "python", "-m", "demucs",
         "--two-stems", "vocals",
-        "--model",     DEMUCS_MODEL,
+        "-n",          DEMUCS_MODEL,
         "--out",       str(demucs_out),
         str(audio_path),
     ]

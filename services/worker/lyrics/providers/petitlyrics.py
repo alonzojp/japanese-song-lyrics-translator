@@ -30,7 +30,7 @@ _MIN_LINES  = 4
 
 class PetitLyricsProvider(LyricsProvider):
     name     = "petitlyrics"
-    priority = 7
+    priority = 4
 
     async def fetch(self, video: VideoInfo) -> Optional[LyricsResult]:
         title = video.title or video.search_query

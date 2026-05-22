@@ -32,8 +32,8 @@ _ANNOTATION_RE = re.compile(
 # Repeated dashes/tildes used as section separators
 _SEPARATOR_RE = re.compile(r"^[-─━=～〜＝]{3,}\s*$")
 
-# Leading/trailing whitespace per line
-_EDGE_SPACE_RE = re.compile(r"^[\s　]+|[\s　]+$", re.MULTILINE)
+# Leading/trailing whitespace per line (excludes \n so line breaks are preserved)
+_EDGE_SPACE_RE = re.compile(r"^[ \t\r　]+|[ \t\r　]+$", re.MULTILINE)
 
 # Multiple consecutive blank lines → single blank line
 _MULTI_BLANK_RE = re.compile(r"\n{3,}")

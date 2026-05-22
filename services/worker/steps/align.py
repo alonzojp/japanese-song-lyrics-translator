@@ -26,6 +26,7 @@ from alignment import (
     save_aligned_lines,
     save_alignment_meta,
 )
+from alignment.onset import measure_and_log as measure_onset
 from cache import is_stage_complete, mark_stage_complete
 from config import WHISPER_MODEL
 
@@ -43,6 +44,7 @@ def run_alignment_postprocess(
     method:           str,
     vocals_only:      bool,
     progress_cb:      ProgressCallback = None,
+    message_cb=None,
     job_log=None,
 ) -> tuple[list[dict], dict]:
     """
@@ -64,6 +66,8 @@ def run_alignment_postprocess(
             return cached, {}
 
     log(f"Post-processing {len(aligned_segments)} segments → LyricLine …")
+    if message_cb:
+        message_cb("Scoring alignment confidence…")
     if progress_cb:
         progress_cb(10)
 
@@ -84,6 +88,8 @@ def run_alignment_postprocess(
         progress_cb(30)
 
     # ── Build LyricLine list ───────────────────────────────────────────────────
+    if message_cb:
+        message_cb("Building lyric lines…")
     lines = build_lyric_lines(aligned_segments, line_confidences=conf.line_confidences)
     log(f"Built {len(lines)} LyricLine objects")
 
@@ -95,6 +101,14 @@ def run_alignment_postprocess(
         duration = sf.info(str(audio_path)).duration
     except Exception:
         duration = 0.0
+
+    # ── Onset timing analysis (instrumentation, no corrections) ───────────────
+    try:
+        asr_path = output_dir / 'vocals_asr.wav'
+        onset_audio = asr_path if asr_path.exists() else audio_path
+        measure_onset(lines, onset_audio, output_dir, job_log=job_log)
+    except Exception as oe:
+        logger.debug("Onset analysis skipped: %s", oe)
 
     # ── Write output files ─────────────────────────────────────────────────────
     save_aligned_lines(output_dir, lines)

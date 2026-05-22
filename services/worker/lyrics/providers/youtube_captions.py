@@ -1,9 +1,10 @@
 """
-Provider 1 & 2 — YouTube official captions + auto-generated captions.
+Provider 1 — YouTube official captions only.
 
 Uses yt-dlp to download subtitle files (no video download).
+Only fetches human-authored subtitles; auto-generated captions are handled
+by YouTubeAutoCaptionsProvider at much lower priority.
 Official captions → priority 1, confidence 0.95
-Auto-generated   → priority 2, confidence 0.72
 
 Parses VTT and JSON3 formats including word-level timestamps from JSON3.
 """
@@ -126,7 +127,7 @@ class YouTubeCaptionsProvider(LyricsProvider):
             tmp_path = Path(tmp)
             ydl_opts = {
                 "writesubtitles":    True,
-                "writeautomaticsub": True,
+                "writeautomaticsub": False,  # official only — auto-captions handled separately
                 "subtitleslangs":    ["ja", "ja-JP", "ja-Hans"],
                 "subtitlesformat":   "json3/vtt/best",
                 "skip_download":     True,
@@ -140,9 +141,9 @@ class YouTubeCaptionsProvider(LyricsProvider):
 
             has_official = bool(info.get("subtitles", {}).get("ja") or
                                 info.get("subtitles", {}).get("ja-JP"))
-            is_auto      = not has_official
+            if not has_official:
+                return None
 
-            # Find the downloaded subtitle file
             sub_files = sorted(tmp_path.glob("subs.*"))
             if not sub_files:
                 return None
@@ -166,21 +167,19 @@ class YouTubeCaptionsProvider(LyricsProvider):
         if not lines:
             return None
 
-        base_conf  = 0.95 if not is_auto else 0.72
         adj        = compute_confidence_adjustment(stats)
         ts_quality = _timestamp_quality(lines)
-        confidence = round(base_conf * adj, 3)
+        confidence = round(0.95 * adj, 3)
 
         return LyricsResult(
             lines=lines,
             raw_text="\n".join(ln.text for ln in lines),
-            provider="youtube_auto_captions" if is_auto else "youtube_captions",
+            provider="youtube_captions",
             confidence=confidence,
             has_timestamps=True,
             timestamp_quality=ts_quality,
             source_url=video.youtube_url,
             metadata={
-                "is_auto":          is_auto,
                 "line_count":       len(lines),
                 "avg_ja_ratio":     stats.get("avg_japanese_ratio"),
                 "preprocess_stats": stats,

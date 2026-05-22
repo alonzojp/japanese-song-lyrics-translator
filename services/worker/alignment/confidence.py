@@ -106,13 +106,14 @@ def compute_confidence(
 
     # Method penalty
     method_factor = {
-        "whisperx":     1.00,
-        "faster-whisper":0.95,
-        "openai-whisper":0.85,
-        "transcriber":  0.90,
-        "aeneas":       0.70,
-        "gentle":       0.55,
-        "even":         0.20,
+        "whisperx_official": 1.00,   # acoustic + correct lyrics text = gold standard
+        "whisperx":          1.00,
+        "faster-whisper":    0.95,
+        "openai-whisper":    0.85,
+        "transcriber":       0.90,
+        "aeneas":            0.70,
+        "gentle":            0.55,
+        "even":              0.20,
     }.get(method, 0.60)
 
     # Composite score

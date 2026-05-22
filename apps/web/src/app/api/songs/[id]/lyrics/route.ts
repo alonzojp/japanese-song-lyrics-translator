@@ -46,3 +46,42 @@ export async function GET(_req: Request, { params }: RouteParams) {
 
   return NextResponse.json({ lines: lyricLines, alignmentMeta });
 }
+
+export async function POST(req: Request, { params }: RouteParams) {
+  const { text } = (await req.json()) as { text: string };
+  if (!text?.trim()) return NextResponse.json({ error: "No lyrics text provided" }, { status: 400 });
+
+  const song = await prisma.song.findUnique({
+    where:  { id: params.id },
+    select: { youtubeId: true },
+  });
+  if (!song) return NextResponse.json({ error: "Song not found" }, { status: 404 });
+
+  await workerClient.uploadManualLyrics(song.youtubeId, text.trim());
+  const result = await workerClient.matchLyrics(song.youtubeId);
+
+  const lines = result.lines ?? [];
+  if (lines.length > 0) {
+    await prisma.lyricLine.deleteMany({ where: { songId: params.id } });
+    await prisma.lyricLine.createMany({
+      data: lines.map((line, i) => ({
+        songId:    params.id,
+        lineIndex: i,
+        startTime: line.startTime,
+        endTime:   line.endTime,
+        japanese:  line.text,
+        words:     line.words ? JSON.stringify(line.words) : null,
+      })),
+    });
+  }
+
+  const lyricLines: LyricLine[] = lines.map((line, i) => ({
+    id:        `line-${i}`,
+    text:      line.text,
+    startTime: line.startTime,
+    endTime:   line.endTime,
+    words:     line.words as WordTiming[] | undefined,
+  }));
+
+  return NextResponse.json({ lines: lyricLines });
+}
