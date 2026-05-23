@@ -111,6 +111,13 @@ def run_alignment_postprocess(
         logger.debug("Onset analysis skipped: %s", oe)
 
     # ── Write output files ─────────────────────────────────────────────────────
+    # Final sanity check on the LyricLine objects (catches issues introduced
+    # by the post-processor that the aligner's own validate didn't see).
+    from alignment.aligner import _sanity_validate
+    _sanity_validate(
+        [{'start': l.get('startTime', 0), 'end': l.get('endTime', 0)} for l in lines],
+        job_log,
+    )
     save_aligned_lines(output_dir, lines)
     save_alignment_meta(
         output_dir,

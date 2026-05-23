@@ -789,6 +789,24 @@ def _split_by_word_gaps(
         if w_end is not None and w_start is not None:
             gaps.append(((float(w_start) - float(w_end)) * 1000, idx))
 
+    # ── Split decision reasoning ───────────────────────────────────────────────
+    if job_log and n > 1:
+        if gaps:
+            gap_vals = [g for g, _ in gaps]
+            job_log.info(
+                f"[split_reason] Seg{seg_id}: {n} lines, {len(words)} tokens  "
+                f"gaps={len(gap_vals)}  mean={sum(gap_vals)/len(gap_vals):.0f}ms  "
+                f"max={max(gap_vals):.0f}ms  min={min(gap_vals):.0f}ms  "
+                f"need={n-1} split(s)",
+                stage="transcribe",
+            )
+        else:
+            job_log.info(
+                f"[split_reason] Seg{seg_id}: {n} lines, {len(words)} tokens  "
+                f"no gaps available → char_weighted fallback",
+                stage="transcribe",
+            )
+
     # ── Select n-1 split points ────────────────────────────────────────────────
     if len(gaps) >= n - 1:
         # Use the n-1 largest gaps — no minimum threshold.
@@ -800,6 +818,12 @@ def _split_by_word_gaps(
             'gap_strong' if all(g >= min_gap_ms for g in chosen_gap_ms)
             else 'gap_weak'
         )
+        if job_log and n > 1:
+            job_log.info(
+                f"[split_reason] Seg{seg_id}: chose {method}  "
+                f"selected_gaps={[round(g,0) for g in chosen_gap_ms]}ms",
+                stage="transcribe",
+            )
     else:
         # Fallback: character-weighted allocation.
         # Longer lyric lines are allocated proportionally more word tokens.
@@ -813,6 +837,12 @@ def _split_by_word_gaps(
             split_at.append(min(max(0, word_pos - 1), total_w - 2))
         chosen_gap_ms = []
         method = 'char_weighted'
+        if job_log and n > 1:
+            job_log.info(
+                f"[split_reason] Seg{seg_id}: fell back to char_weighted  "
+                f"(only {len(gaps)} gaps, need {n-1})",
+                stage="transcribe",
+            )
 
     # ── Build lines from word groups ───────────────────────────────────────────
     edges  = [0] + [s + 1 for s in split_at] + [len(words)]
@@ -840,19 +870,31 @@ def _split_by_word_gaps(
         line_dur = round(end_t - start_t, 3)
         dur_flag = ' ⚑SHORT' if line_dur < _MIN_LINE_DISPLAY_S else ''
 
-        result.append({
+        # Boundary confidence for the transition OUT of this line to the next
+        b_conf:  Optional[float] = None
+        b_label: str             = ''
+        if i < n - 1:
+            b_conf, b_label = _boundary_conf_score(boundary_gap_ms, method)
+
+        line_dict: dict = {
             'text':  text,
             'start': round(start_t, 3),
             'end':   round(end_t,   3),
             'words': grp,
-        })
+        }
+        if b_conf is not None:
+            line_dict['_boundary_conf']       = b_conf
+            line_dict['_boundary_conf_label'] = b_label
+
+        result.append(line_dict)
 
         if job_log:
-            gap_str = f" next_gap={boundary_gap_ms:.0f}ms" if boundary_gap_ms is not None else ""
+            gap_str  = f" next_gap={boundary_gap_ms:.0f}ms" if boundary_gap_ms is not None else ""
+            conf_str = f" bconf={b_conf:.2f}({b_label})" if b_conf is not None else ""
             job_log.info(
                 f"[split] Seg{seg_id} line{i}: {start_t:.3f}–{end_t:.3f}s "
                 f"dur={line_dur:.3f}s words={len(grp)} method={method}"
-                f"{gap_str}{dur_flag}  '{text[:28]}'",
+                f"{gap_str}{conf_str}{dur_flag}  '{text[:28]}'",
                 stage="transcribe",
             )
 
@@ -869,9 +911,16 @@ def _split_by_word_gaps(
 
     # Enforce minimum line duration — steal time from adjacent lines when a
     # short gap produces a line too brief to read (<_MIN_LINE_DISPLAY_S).
-    return _enforce_min_durations(
+    result = _enforce_min_durations(
         result, _MIN_LINE_DISPLAY_S, parent_seg.get('end', 0.0), job_log, seg_id
     )
+
+    # Token-to-line assignment map and acoustic vs proportional comparison
+    _log_token_map(result, seg_id, job_log)
+    if n > 1 and job_log:
+        _compare_splits(result, _proportional_line(parent_seg, line_texts), seg_id, job_log)
+
+    return result
 
 
 def _apply_vad_anchor(
@@ -1321,6 +1370,11 @@ def _align_whisperx_with_official_lyrics(
         chars = _collect_chars(matched)
         words = _collect_words(matched)
 
+        # Raw WhisperX dump — shows exactly what CTC alignment produced
+        if matched and job_log:
+            for _mi, _ms in enumerate(matched):
+                _log_wx_raw(i, _ms, job_log)
+
         # ── Debug: record segment baseline ───────────────────────────────────
         _dbg.record_segment(i, seg_start, seg_end, matched, line_texts or [], chars, words)
 
@@ -1427,6 +1481,8 @@ def _align_whisperx_with_official_lyrics(
                         stage="transcribe",
                     )
 
+            _segment_quality(candidates, source, i, job_log)
+
             for c in candidates:
                 c['_timing_source'] = source
             final.extend(candidates)
@@ -1498,7 +1554,10 @@ def _align_whisperx_with_official_lyrics(
             stage="transcribe",
         )
 
-    # ── 5a. Boundary audit ───────────────────────────────────────────────────
+    # ── 5a. Drift curve (before gap-bridging adjusts end times) ─────────────
+    _log_drift_curve(final, rough_segments, job_log)
+
+    # ── 5b. Boundary audit ───────────────────────────────────────────────────
     _audit_boundaries(final, job_log)
 
     # ── 5. Bridge small gaps ──────────────────────────────────────────────────
@@ -1542,7 +1601,10 @@ def _align_whisperx_with_official_lyrics(
                 stage="transcribe",
             )
 
-    # ── Save debug report ────────────────────────────────────────────────────
+    # ── Sanity validation ─────────────────────────────────────────────────────
+    _sanity_validate(final, job_log)
+
+    # ── Save debug report ─────────────────────────────────────────────────────
     try:
         _dbg.save(audio_path.parent)
     except Exception as _de:
@@ -1595,6 +1657,238 @@ def _is_pathological_split(candidates: list[dict]) -> tuple[bool, str]:
         )
 
     return False, ""
+
+
+# ── Deep observability helpers ────────────────────────────────────────────────
+
+def _split_quality_metrics(candidates: list[dict]) -> dict:
+    """Pure-function quality metrics for a list of timed line dicts."""
+    if not candidates:
+        return {'n': 0}
+    durs    = [max(0.0, c.get('end', 0.0) - c.get('start', 0.0)) for c in candidates]
+    n       = len(durs)
+    min_d   = min(durs);  max_d = max(durs)
+    mean_d  = sum(durs) / n
+    mad     = sum(abs(d - mean_d) for d in durs) / n
+    ratio   = max_d / min_d if min_d > 0 else float('inf')
+    n_short = sum(1 for d in durs if d < _SAFEGUARD_MIN_DUR_S)
+    wcs     = [len(c.get('words', [])) for c in candidates]
+    return {
+        'n': n,
+        'min':   round(min_d,  3),
+        'max':   round(max_d,  3),
+        'mean':  round(mean_d, 3),
+        'mad':   round(mad,    3),
+        'ratio': round(ratio, 1) if ratio != float('inf') else float('inf'),
+        'n_short':      n_short,
+        'n_zero_words': sum(1 for w in wcs if w == 0),
+        'word_counts':  wcs,
+    }
+
+
+def _boundary_conf_score(gap_ms: Optional[float], method: str) -> tuple[float, str]:
+    """Return (confidence 0–1, label) for a single line boundary."""
+    if method in ('proportional', 'char_weighted', 'silence_split'):
+        return 0.10, 'no_acoustic'
+    if method == 'char_boundary':
+        return 0.50, 'char'
+    if gap_ms is None:
+        return 0.20, 'unknown'
+    if gap_ms >= _WORD_GAP_SPLIT_MS:    # default 120 ms
+        return 0.85, 'strong_gap'
+    if gap_ms >= 50:
+        return 0.60, 'moderate_gap'
+    if gap_ms >= 20:
+        return 0.35, 'weak_gap'
+    return 0.15, 'micro_gap'
+
+
+def _compare_splits(
+    acoustic:     list[dict],
+    proportional: list[dict],
+    seg_id:       int,
+    job_log=None,
+) -> None:
+    """[compare] Side-by-side quality metrics for acoustic vs proportional splits."""
+    if not job_log:
+        return
+    am      = _split_quality_metrics(acoustic)
+    pm      = _split_quality_metrics(proportional)
+    a_ratio = am.get('ratio', float('inf'))
+    p_ratio = pm.get('ratio', 1.0)
+    verdict = (
+        'proportional_superior'
+        if (isinstance(a_ratio, float) and a_ratio > max(p_ratio * 2, 8))
+        else 'acoustic_ok'
+    )
+    job_log.info(
+        f"[compare] Seg{seg_id}  "
+        f"acoustic ratio={a_ratio}x mad={am.get('mad',0):.3f}s short={am.get('n_short',0)} | "
+        f"proportional ratio={p_ratio}x mad={pm.get('mad',0):.3f}s "
+        f"→ {verdict}",
+        stage="transcribe",
+    )
+
+
+def _segment_quality(
+    candidates: list[dict],
+    method:     str,
+    seg_id:     int,
+    job_log=None,
+) -> float:
+    """[quality] Compute and log a quality score (0–1) for a segment's split."""
+    m     = _split_quality_metrics(candidates)
+    score = 1.0
+    flags: list[str] = []
+
+    if m.get('n_short', 0) > 0:
+        score -= 0.30
+        flags.append(f"{m['n_short']} ultra-short")
+
+    ratio = m.get('ratio', 1.0)
+    if isinstance(ratio, float) and ratio > _SAFEGUARD_MAX_RATIO:
+        score -= min(0.40, (ratio - _SAFEGUARD_MAX_RATIO) / 50)
+        flags.append(f"ratio={ratio:.0f}x")
+
+    if method in ('proportional', 'char_weighted'):
+        score -= 0.15
+        flags.append(f"method={method}")
+
+    n_zero = m.get('n_zero_words', 0)
+    if m.get('n', 1) and n_zero > m['n'] * 0.3:
+        score -= 0.20
+        flags.append(f"{n_zero} zero-word lines")
+
+    score = round(max(0.0, min(1.0, score)), 3)
+
+    if job_log:
+        flag_str = ' | '.join(flags) if flags else 'ok'
+        level    = 'warning' if score < 0.40 else 'info'
+        getattr(job_log, level)(
+            f"[quality] Seg{seg_id} score={score:.2f}"
+            + (' ⚑BAD' if score < 0.40 else '')
+            + f"  mad={m.get('mad',0):.3f}s ratio={ratio}x"
+            + f"  words={m.get('word_counts',[])}  {flag_str}",
+            stage="transcribe",
+        )
+    return score
+
+
+def _log_token_map(result: list[dict], seg_id: int, job_log=None) -> None:
+    """[token_map] Log exact word-token assignments per lyric line."""
+    if not job_log:
+        return
+    job_log.info(f"[token_map] Seg{seg_id}:", stage="transcribe")
+    for li, line in enumerate(result):
+        words  = line.get('words', [])
+        tokens = [w.get('word', '?') for w in words]
+        t0     = words[0].get('start') if words else None
+        t1     = words[-1].get('end')  if words else None
+        span   = f"[{t0:.3f}–{t1:.3f}s]" if t0 is not None and t1 is not None else "[no_ts]"
+        conf   = line.get('_boundary_conf')
+        conf_s = f" bconf={conf:.2f}" if conf is not None else ""
+        job_log.info(
+            f"[token_map]   L{li} {span}{conf_s} ← {tokens[:12]}"
+            + (" …" if len(tokens) > 12 else ""),
+            stage="transcribe",
+        )
+
+
+def _log_wx_raw(seg_idx: int, seg: dict, job_log=None) -> None:
+    """[wx_raw] Log raw WhisperX segment data before post-processing (first+last 5 words)."""
+    if not job_log:
+        return
+    words    = seg.get('words', [])
+    n_words  = len(words)
+    head     = words[:5]
+    tail     = words[-2:] if n_words > 7 else []
+    fmt      = lambda w: f"{w.get('word','?')}@{w.get('start',0):.2f}s"  # noqa: E731
+    parts    = [fmt(w) for w in head]
+    if tail:
+        parts += ['…'] + [fmt(w) for w in tail]
+    job_log.info(
+        f"[wx_raw] Seg{seg_idx} {seg.get('start',0):.3f}–{seg.get('end',0):.3f}s "
+        f"({n_words} words): [{', '.join(parts)}]",
+        stage="transcribe",
+    )
+
+
+def _log_drift_curve(
+    final:          list[dict],
+    rough_segments: list[dict],
+    job_log=None,
+) -> None:
+    """[drift_curve] Per-segment drift: actual first-line-start vs rough-seg-start."""
+    if not job_log or not final or not rough_segments:
+        return
+    job_log.info("[drift_curve] Seg  rough_start → first_line_start  drift  cumulative",
+                 stage="transcribe")
+    cumul = 0.0
+    for si, rough in enumerate(rough_segments):
+        rs = rough.get('start', 0.0)
+        re = rough.get('end',   0.0)
+        # Find first final line whose start falls in or near this segment
+        first = next(
+            (l for l in final if rs - 1.0 <= l.get('start', 0.0) <= re + 1.0),
+            None,
+        )
+        if first is None:
+            continue
+        drift_ms = (first.get('start', rs) - rs) * 1000
+        cumul   += drift_ms
+        flag     = '  ⚑LARGE' if abs(drift_ms) > 500 else ''
+        job_log.info(
+            f"[drift_curve] Seg{si:02d}  {rs:.3f}s → {first.get('start',rs):.3f}s  "
+            f"{drift_ms:+.0f}ms  cumul={cumul:+.0f}ms{flag}",
+            stage="transcribe",
+        )
+
+
+def _sanity_validate(lines: list[dict], job_log) -> bool:
+    """
+    [sanity] Final validation pass before writing aligned_lines.json.
+    Logs PASS/FAIL with specifics. Does NOT block writing — diagnostic only.
+    Returns True if output is usable.
+    """
+    if not job_log or not lines:
+        return True
+
+    n        = len(lines)
+    durs     = [max(0.0, l.get('end', 0) - l.get('start', 0)) for l in lines]
+    min_d    = min(durs);  max_d = max(durs)
+    ratio    = max_d / min_d if min_d > 0 else float('inf')
+    n_short  = sum(1 for d in durs if d < _SAFEGUARD_MIN_DUR_S)
+    n_nonmono = sum(
+        1 for i in range(1, n)
+        if lines[i].get('start', 0) < lines[i-1].get('end', 0) - 0.01
+    )
+    n_big_gap = sum(
+        1 for i in range(1, n)
+        if lines[i].get('start', 0) - lines[i-1].get('end', 0) > 3.0
+    )
+
+    failures: list[str] = []
+    if n_short:
+        failures.append(f"{n_short} lines < {_SAFEGUARD_MIN_DUR_S}s")
+    if isinstance(ratio, float) and ratio > 20:
+        failures.append(f"max/min ratio={ratio:.0f}x")
+    if n_nonmono:
+        failures.append(f"{n_nonmono} non-monotonic boundaries")
+    if n_big_gap > 2:
+        failures.append(f"{n_big_gap} gaps > 3s")
+
+    usable = not failures
+    if failures:
+        job_log.warning(
+            f"[sanity] FAIL ({n} lines): {' | '.join(failures)} — karaoke timing may be unusable",
+            stage="align",
+        )
+    else:
+        job_log.info(
+            f"[sanity] PASS: {n} lines  ratio={ratio:.1f}x  no anomalies",
+            stage="align",
+        )
+    return usable
 
 
 # ── Boundary audit ────────────────────────────────────────────────────────────
