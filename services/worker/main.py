@@ -13,7 +13,7 @@ from pathlib import Path
 
 from fastapi import BackgroundTasks, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, Field
 from typing import Optional
 
@@ -21,7 +21,7 @@ from alignment.matcher   import match_lyric_lines, run_offline_match
 from alignment.selector  import select_best_alignment
 from cache import cache_dir, cleanup_old, list_cached
 from config import CACHE_MAX_AGE_DAYS, WHISPER_MODEL, WORKER_CONCURRENCY
-from logs import get_recent_logs
+from logs import get_recent_logs, get_best_logs
 from lyrics.fetcher import fetch_lyrics, get_cached as get_cached_lyrics
 from lyrics.providers.manual import store_manual
 from lyrics.types import VideoInfo
@@ -134,7 +134,10 @@ async def get_job_endpoint(job_id: str) -> dict:
     job = get_job(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
-    logs = get_recent_logs(job_id, limit=40)
+    # Return full log history for completed jobs so the frontend can persist them.
+    # For in-progress jobs 40 is enough for the live panel without bloating polls.
+    log_limit = 2000 if job.status == JobStatus.completed else 40
+    logs = get_recent_logs(job_id, limit=log_limit)
     return job.to_api(logs=logs)
 
 
@@ -201,6 +204,28 @@ async def fetch_lyrics_endpoint(body: FetchLyricsRequest) -> dict:
     )
     result = await fetch_lyrics(video, force=body.force)
     return result
+
+
+@app.get("/cache/{youtube_id}/diagnostic")
+async def download_diagnostic(youtube_id: str):
+    """Download alignment_diagnostic.txt for a video (plain text, for debugging)."""
+    path = cache_dir(youtube_id) / "alignment_diagnostic.txt"
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="No diagnostic file — run alignment first")
+    return FileResponse(str(path), media_type="text/plain",
+                        filename=f"{youtube_id}_alignment_diagnostic.txt")
+
+
+@app.get("/cache/{youtube_id}/logs")
+async def get_video_logs(youtube_id: str, limit: int = 2000):
+    """
+    Return logs from the most log-rich completed job for this video.
+    Bypasses currentJobId so re-submitted instant-cache jobs don't hide
+    the full diagnostic log from a previous full run.
+    """
+    logs = get_best_logs(youtube_id, limit=limit)
+    logger.info("[log_debug] /cache/%s/logs returning %d entries", youtube_id, len(logs))
+    return {"youtubeId": youtube_id, "logCount": len(logs), "logs": logs}
 
 
 @app.get("/lyrics/{youtube_id}")

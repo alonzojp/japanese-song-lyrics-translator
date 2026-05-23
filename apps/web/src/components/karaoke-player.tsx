@@ -3,7 +3,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   Play, Pause, Loader2, CheckCircle2, XCircle, Zap,
-  ChevronDown, ChevronUp, Terminal, BookOpen, MousePointer2,
+  ChevronDown, ChevronUp, Terminal, BookOpen, MousePointer2, Copy, Check,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -118,8 +118,31 @@ function StepRow({ step }: { step: JobStepInfo }) {
 
 function LogPanel({ logs }: { logs: JobLogEntry[] }) {
   const [open, setOpen]        = useState(false);
+  const [copied, setCopied]    = useState(false);
   const containerRef           = useRef<HTMLDivElement>(null);
   const userScrolledUpRef      = useRef(false);
+
+  function copyLogs() {
+    const text = logs
+      .map((e) => `${new Date(e.ts).toLocaleTimeString()} [${e.stage ?? "—"}] ${e.message}`)
+      .join("\n");
+    const finish = () => { setCopied(true); setTimeout(() => setCopied(false), 2000); };
+    if (navigator.clipboard?.writeText) {
+      navigator.clipboard.writeText(text).then(finish).catch(() => fallbackCopy(text, finish));
+    } else {
+      fallbackCopy(text, finish);
+    }
+  }
+
+  function fallbackCopy(text: string, onDone: () => void) {
+    const el = document.createElement("textarea");
+    el.value = text;
+    el.style.cssText = "position:fixed;opacity:0;pointer-events:none";
+    document.body.appendChild(el);
+    el.select();
+    try { document.execCommand("copy"); onDone(); } catch { /* silent */ }
+    document.body.removeChild(el);
+  }
 
   // Reset intent flag when panel opens so it starts pinned to bottom
   useEffect(() => {
@@ -143,16 +166,27 @@ function LogPanel({ logs }: { logs: JobLogEntry[] }) {
 
   return (
     <div className="rounded-lg border border-border bg-muted/30">
-      <button
-        onClick={() => setOpen((o) => !o)}
-        className="flex w-full items-center justify-between px-4 py-2 text-xs text-muted-foreground hover:text-foreground"
-      >
-        <span className="flex items-center gap-1.5">
+      <div className="flex items-center justify-between px-4 py-2">
+        <button
+          onClick={() => setOpen((o) => !o)}
+          className="flex flex-1 items-center gap-1.5 text-xs text-muted-foreground hover:text-foreground"
+        >
           <Terminal className="h-3.5 w-3.5" />
           Processing log ({logs.length} entries)
-        </span>
-        {open ? <ChevronUp className="h-3.5 w-3.5" /> : <ChevronDown className="h-3.5 w-3.5" />}
-      </button>
+          {process.env.NODE_ENV !== "production" && (
+            <span className="ml-1 text-primary/50">[rendered {logs.length}]</span>
+          )}
+          {open ? <ChevronUp className="h-3.5 w-3.5 ml-1" /> : <ChevronDown className="h-3.5 w-3.5 ml-1" />}
+        </button>
+        <button
+          onClick={copyLogs}
+          className="flex items-center gap-1 rounded px-2 py-0.5 text-xs text-muted-foreground hover:text-foreground hover:bg-muted transition-colors"
+          title="Copy all logs"
+        >
+          {copied ? <Check className="h-3 w-3 text-green-500" /> : <Copy className="h-3 w-3" />}
+          {copied ? "Copied" : "Copy"}
+        </button>
+      </div>
 
       {open && (
         <div
@@ -246,6 +280,7 @@ export function KaraokePlayer({
   const [pasteText, setPasteText]       = useState("");
   const [pasteError, setPasteError]     = useState<string | null>(null);
   const [isPasteLoading, setIsPasteLoading] = useState(false);
+  const [completedLogs, setCompletedLogs] = useState<JobLogEntry[]>([]);
   const pollRef                         = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // ── YouTube player refs ───────────────────────────────────────────────────────
@@ -343,6 +378,14 @@ export function KaraokePlayer({
       setJobStatus(data.status);
 
       if (data.status === "completed") {
+        // Fetch best logs via song endpoint (bypasses currentJobId race)
+        fetch(`/api/songs/${songId}/logs`)
+          .then((r) => r.ok ? r.json() : null)
+          .then((d: { logs?: JobLogEntry[]; logCount?: number } | null) => {
+            console.log(`[log_debug] API returned ${d?.logCount ?? 0} log entries`);
+            if (d?.logs?.length) setCompletedLogs(d.logs);
+          })
+          .catch(() => null);
         await reloadLyrics();
       } else if (data.status === "processing" || data.status === "queued") {
         pollRef.current = setTimeout(() => poll(id), POLL_MS);
@@ -366,6 +409,19 @@ export function KaraokePlayer({
         .catch(() => null);
     }
   }, [initialJobId, initialStatus, initialLyrics.length, reloadLyrics]);
+
+  // Fetch full logs on mount — always uses song-level endpoint which finds
+  // the most log-rich job, not just currentJobId (avoids instant-cache shadowing).
+  useEffect(() => {
+    fetch(`/api/songs/${songId}/logs`)
+      .then((r) => r.ok ? r.json() : null)
+      .then((data: { logs?: JobLogEntry[]; logCount?: number } | null) => {
+        console.log(`[log_debug] mount: API returned ${data?.logCount ?? 0} entries`);
+        if (data?.logs?.length) setCompletedLogs(data.logs);
+      })
+      .catch(() => null);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);  // intentionally runs once on mount only
 
   // ── YouTube IFrame API ────────────────────────────────────────────────────────
 
@@ -812,6 +868,11 @@ export function KaraokePlayer({
             </div>
           </CardContent>
         </Card>
+      )}
+
+      {/* Last run logs — visible after job completes */}
+      {isDone && completedLogs.length > 0 && (
+        <LogPanel logs={completedLogs} />
       )}
 
       {/* Selection tray (fixed bottom bar when items selected) */}

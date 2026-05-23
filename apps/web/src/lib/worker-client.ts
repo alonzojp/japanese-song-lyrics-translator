@@ -3,6 +3,7 @@ import type {
   CreateJobResponse,
   FetchLyricsRequest,
   Job,
+  JobLogEntry,
   JobResult,
   LyricsResult,
   WorkerHealth,
@@ -65,5 +66,9 @@ export const workerClient = {
 
   matchLyrics(youtubeId: string): Promise<{ lines: Array<{ text: string; startTime: number; endTime: number; words?: unknown[] }> }> {
     return workerFetch(`/alignment/${youtubeId}/match`, { method: "POST" });
+  },
+
+  getBestLogs(youtubeId: string): Promise<{ youtubeId: string; logCount: number; logs: JobLogEntry[] }> {
+    return workerFetch(`/cache/${youtubeId}/logs`);
   },
 };

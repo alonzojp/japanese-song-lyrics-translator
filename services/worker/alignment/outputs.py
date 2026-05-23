@@ -15,11 +15,15 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-TRANSCRIPT_FILE    = "transcript.json"
-ALIGNED_WORDS_FILE = "aligned_words.json"
-ALIGNED_LINES_FILE = "aligned_lines.json"
+TRANSCRIPT_FILE     = "transcript.json"
+ALIGNED_WORDS_FILE  = "aligned_words.json"
+ALIGNED_LINES_FILE  = "aligned_lines.json"
 ALIGNMENT_META_FILE = "alignment_meta.json"
-LYRICS_FILE        = "lyrics.json"
+LYRICS_FILE         = "lyrics.json"
+
+# Bump this string whenever alignment logic changes so stale aligned_words.json
+# files are automatically rejected and force_align() re-runs.
+ALIGNER_VERSION = "4"
 
 
 def save_transcript(output_dir: Path, segments: list[dict], backend: str) -> Path:
@@ -41,6 +45,7 @@ def save_aligned_words(
 ) -> Path:
     path = output_dir / ALIGNED_WORDS_FILE
     payload = {
+        "alignerVersion":  ALIGNER_VERSION,
         "alignmentMethod": method,
         "segmentCount":    len(segments),
         "savedAt":         _now(),
@@ -115,7 +120,15 @@ def load_aligned_words(output_dir: Path) -> Optional[tuple[list[dict], str]]:
     path = output_dir / ALIGNED_WORDS_FILE
     if not path.exists():
         return None
-    data = json.loads(path.read_text(encoding="utf-8"))
+    data    = json.loads(path.read_text(encoding="utf-8"))
+    version = data.get("alignerVersion", "0")
+    if version != ALIGNER_VERSION:
+        import logging
+        logging.getLogger(__name__).info(
+            f"aligned_words.json version mismatch ({version} != {ALIGNER_VERSION}) "
+            f"at {path} — discarding cache, will re-align"
+        )
+        return None
     return data.get("segments"), data.get("alignmentMethod", "unknown")
 
 

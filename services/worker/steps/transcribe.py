@@ -114,7 +114,7 @@ def run_transcription(
 
     if loaded_aligned:
         aligned_segs, method = loaded_aligned
-        log(f"Loaded cached alignment ({method})")
+        log(f"Loaded cached alignment ({method}) from {output_dir / 'aligned_words.json'}")
     else:
         if official_lyrics:
             log(f"Running forced alignment with {len(official_lyrics)} official lyrics lines…")
@@ -135,7 +135,8 @@ def run_transcription(
             progress_cb=al_cb, job_log=job_log,
         )
         log(f"Alignment complete via {method}: {len(aligned_segs)} segments")
-        save_aligned_words(output_dir, aligned_segs, method)
+        saved = save_aligned_words(output_dir, aligned_segs, method)
+        log(f"Wrote aligned_words.json → {saved}")
 
     # ── Update manifest ────────────────────────────────────────────────────────
     mark_stage_complete(youtube_id, "transcribe", {

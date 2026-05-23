@@ -32,6 +32,8 @@ _RMS_HOP_MS         = 50     # ms per RMS window for silence detection
 _MIN_SPLIT_SEP      = 1.0    # minimum seconds between detected split points
 _WORD_GAP_SPLIT_MS  = 120.0  # inter-word pause threshold for line boundary detection
 _MAX_CTC_LAG_S      = 3.0    # VAD anchor skipped when offset ≥ this (legitimate fill)
+_MIN_LINE_DISPLAY_S  = 0.25   # lines shorter than this are flagged and corrected
+_DRIFT_CORRECT_THRESH = 0.40  # extend last line if > this many seconds remain before seg_end
 
 # ── Feature flags ─────────────────────────────────────────────────────────────
 # Phase 1: text-informed segment mapping (char bigrams + English anchors + greedy monotone).
@@ -677,28 +679,98 @@ def _proportional_line(
     return result
 
 
+def _enforce_min_durations(
+    lines:   list[dict],
+    min_dur: float,
+    seg_end: float,
+    job_log=None,
+    seg_id:  int = -1,
+) -> list[dict]:
+    """
+    Enforce a minimum display duration on every lyric line.
+
+    Scans forward; when a line is too short it steals time from the next line
+    (advances next_start) up to the point where the next line would itself fall
+    below min_dur.  Any line that cannot be fixed is logged as a warning.
+
+    Must run AFTER word-gap splitting and BEFORE gap bridging so the corrected
+    boundaries feed into the final timeline.
+    """
+    if len(lines) <= 1:
+        return lines
+
+    result = [dict(ln) for ln in lines]
+
+    for i in range(len(result) - 1):   # last line handled by drift correction
+        dur = result[i].get('end', 0.0) - result[i].get('start', 0.0)
+        if dur >= min_dur:
+            continue
+
+        next_end   = result[i + 1].get('end',   0.0)
+        next_start = result[i + 1].get('start', 0.0)
+        next_dur   = next_end - next_start
+        can_give   = max(0.0, next_dur - min_dur)
+        need       = min_dur - dur
+        give       = min(need, can_give)
+
+        if give > 0.005:
+            new_end        = round(result[i]['end']       + give, 3)
+            new_next_start = round(result[i + 1]['start'] + give, 3)
+            if job_log:
+                job_log.info(
+                    f"[min_dur] Seg{seg_id} line{i}: dur={dur:.3f}s < {min_dur}s "
+                    f"— end {result[i]['end']:.3f}→{new_end:.3f}s  "
+                    f"next_start {result[i+1]['start']:.3f}→{new_next_start:.3f}s",
+                    stage="transcribe",
+                )
+            result[i]['end']       = new_end
+            result[i + 1]['start'] = new_next_start
+            dur = new_end - result[i]['start']
+
+        if dur < min_dur and job_log:
+            job_log.warning(
+                f"[min_dur] Seg{seg_id} line{i}: dur={dur:.3f}s still < {min_dur}s "
+                f"— '{result[i].get('text', '')[:32]}'",
+                stage="transcribe",
+            )
+
+    return result
+
+
 def _split_by_word_gaps(
     words:      list[dict],
     line_texts: list[str],
     parent_seg: dict,
     min_gap_ms: float = _WORD_GAP_SPLIT_MS,
+    job_log     = None,
+    seg_id:     int    = -1,
 ) -> list[dict]:
     """
-    Split word tokens into lyric lines at natural inter-word pauses.
+    Split word tokens into lyric lines using acoustic word boundary timing.
 
-    Primary timing method — replaces all character-ratio proportional splitting.
-    Timestamps come exclusively from word token start/end values; no interpolation.
+    Priority order:
+      1. Inter-word pause detection — ALWAYS uses the n-1 largest gaps as split
+         points, with NO minimum threshold.  Even a 10ms pause is more reliable
+         than arbitrary word-count arithmetic.  Gaps are classified as 'strong'
+         (≥ min_gap_ms) or 'weak' (best available) in the debug log.
+      2. Character-weighted word allocation — fallback when the word sequence has
+         fewer gaps than needed (e.g. very dense singing or word-count < n).
+         Allocates words proportionally to lyric character counts so that longer
+         lines receive proportionally more time.  Always better than even count.
+      3. Proportional line timing — only when no word timestamps exist at all.
 
-    Algorithm:
-      1. Compute gap = next_word.start − current_word.end for every adjacent pair
-      2. If ≥ n-1 gaps exist with gap ≥ min_gap_ms: use the n-1 largest as boundaries
-      3. Otherwise: divide words evenly by COUNT (not character ratio) — timing still
-         from word tokens
-      4. Each line: start = first_word.start, end = last_word.end
+    Removing the minimum-gap threshold eliminates cumulative timing drift:
+    the largest gap in a phrase group almost always corresponds to the real
+    lyric line boundary, even when singers don't pause explicitly.
     """
     n = len(line_texts)
 
     if not words:
+        if job_log:
+            job_log.info(
+                f"[split] Seg{seg_id}: no word timestamps — proportional fallback",
+                stage="transcribe",
+            )
         return _proportional_line(parent_seg, line_texts)
 
     if n == 1:
@@ -709,26 +781,38 @@ def _split_by_word_gaps(
             'words': words,
         }]
 
-    # ── Compute inter-word gaps ────────────────────────────────────────────────
-    gaps: list[tuple[float, int]] = []   # (gap_ms, index of word before gap)
-    for i in range(len(words) - 1):
-        w_end   = words[i].get('end')
-        w_start = words[i + 1].get('start')
+    # ── Compute all inter-word gaps ────────────────────────────────────────────
+    gaps: list[tuple[float, int]] = []   # (gap_ms, word_index_before_gap)
+    for idx in range(len(words) - 1):
+        w_end   = words[idx].get('end')
+        w_start = words[idx + 1].get('start')
         if w_end is not None and w_start is not None:
-            gaps.append(((float(w_start) - float(w_end)) * 1000, i))
+            gaps.append(((float(w_start) - float(w_end)) * 1000, idx))
 
-    # ── Choose n-1 split points ────────────────────────────────────────────────
-    qualifying = [(g, i) for g, i in gaps if g >= min_gap_ms]
-
-    if len(qualifying) >= n - 1:
-        # Use the n-1 largest natural pauses — primary acoustic boundary signal
-        top      = sorted(qualifying, key=lambda x: -x[0])[:n - 1]
-        split_at = sorted(idx for _, idx in top)   # chronological order
+    # ── Select n-1 split points ────────────────────────────────────────────────
+    if len(gaps) >= n - 1:
+        # Use the n-1 largest gaps — no minimum threshold.
+        # Any acoustic gap outperforms word-count arithmetic.
+        top        = sorted(gaps, key=lambda x: -x[0])[:n - 1]
+        split_at   = sorted(idx for _, idx in top)
+        chosen_gap_ms = [g for g, i in sorted(top, key=lambda x: split_at.index(x[1]))]
+        method     = (
+            'gap_strong' if all(g >= min_gap_ms for g in chosen_gap_ms)
+            else 'gap_weak'
+        )
     else:
-        # No detectable pauses — divide words evenly by count, NOT character ratio
-        k        = len(words)
-        split_at = [max(0, min(k - 2, int(round((j + 1) * k / n)) - 1))
-                    for j in range(n - 1)]
+        # Fallback: character-weighted allocation.
+        # Longer lyric lines are allocated proportionally more word tokens.
+        counts    = [max(1, _char_count(t)) for t in line_texts]
+        total_c   = sum(counts)
+        total_w   = len(words)
+        split_at  = []
+        word_pos  = 0
+        for cnt in counts[:-1]:
+            word_pos += max(1, round(cnt / total_c * total_w))
+            split_at.append(min(max(0, word_pos - 1), total_w - 2))
+        chosen_gap_ms = []
+        method = 'char_weighted'
 
     # ── Build lines from word groups ───────────────────────────────────────────
     edges  = [0] + [s + 1 for s in split_at] + [len(words)]
@@ -740,10 +824,21 @@ def _split_by_word_gaps(
             start_t = float(grp[0].get('start') or parent_seg.get('start', 0.0))
             end_t   = float(grp[-1].get('end')   or parent_seg.get('end',   0.0))
         else:
-            # Empty allocation (more lines than word tokens) — proportional fallback
+            # More lines than word tokens — proportional emergency fallback
             seg_dur = max(0.001, parent_seg.get('end', 0.0) - parent_seg.get('start', 0.0))
             start_t = parent_seg.get('start', 0.0) + i * seg_dur / n
             end_t   = start_t + seg_dur / n
+
+        # Gap between this line's last word and the next line's first word
+        boundary_gap_ms: Optional[float] = None
+        if i < n - 1 and edges[i + 1] < len(words) and grp:
+            nw_start = words[edges[i + 1]].get('start')
+            lw_end   = grp[-1].get('end')
+            if nw_start is not None and lw_end is not None:
+                boundary_gap_ms = round((float(nw_start) - float(lw_end)) * 1000, 1)
+
+        line_dur = round(end_t - start_t, 3)
+        dur_flag = ' ⚑SHORT' if line_dur < _MIN_LINE_DISPLAY_S else ''
 
         result.append({
             'text':  text,
@@ -752,7 +847,31 @@ def _split_by_word_gaps(
             'words': grp,
         })
 
-    return result
+        if job_log:
+            gap_str = f" next_gap={boundary_gap_ms:.0f}ms" if boundary_gap_ms is not None else ""
+            job_log.info(
+                f"[split] Seg{seg_id} line{i}: {start_t:.3f}–{end_t:.3f}s "
+                f"dur={line_dur:.3f}s words={len(grp)} method={method}"
+                f"{gap_str}{dur_flag}  '{text[:28]}'",
+                stage="transcribe",
+            )
+
+    if job_log and n > 1:
+        split_times = [
+            round(words[s].get('end', 0), 3)
+            for s in split_at if s < len(words)
+        ]
+        job_log.info(
+            f"[split] Seg{seg_id}: {n} lines, method={method}, "
+            f"split_after_word_ends={split_times}",
+            stage="transcribe",
+        )
+
+    # Enforce minimum line duration — steal time from adjacent lines when a
+    # short gap produces a line too brief to read (<_MIN_LINE_DISPLAY_S).
+    return _enforce_min_durations(
+        result, _MIN_LINE_DISPLAY_S, parent_seg.get('end', 0.0), job_log, seg_id
+    )
 
 
 def _apply_vad_anchor(
@@ -1229,8 +1348,25 @@ def _align_whisperx_with_official_lyrics(
         if len(line_texts) > 1:
             if words:
                 # PRIMARY: word-gap boundary detection — acoustic, no char-ratio
-                candidates = _split_by_word_gaps(words, line_texts, eff_seg)
-                source     = 'word_boundary'
+                candidates = _split_by_word_gaps(
+                    words, line_texts, eff_seg,
+                    job_log=job_log, seg_id=i,
+                )
+                source = 'word_boundary'
+
+                # Safety check: reject pathological splits (ultra-short lines,
+                # extreme duration ratios, or mostly single-word allocations).
+                # These indicate word timestamps are too sparse or noisy to use.
+                bad, reason = _is_pathological_split(candidates)
+                if bad:
+                    if job_log:
+                        job_log.warning(
+                            f"[safeguard] Seg{i}: acoustic split rejected — {reason} "
+                            f"— falling back to proportional",
+                            stage="transcribe",
+                        )
+                    candidates = _proportional_line(orig_seg, line_texts)
+                    source     = 'proportional'
             elif chars:
                 # SECONDARY: char-level CTC timestamps (no word data available)
                 char_cands = _boundary_from_chars(chars, line_texts, seg_start, seg_end)
@@ -1258,6 +1394,39 @@ def _align_whisperx_with_official_lyrics(
         )
 
         if valid:
+            # ── Intra-segment drift correction ────────────────────────────────
+            # WhisperX CTC timestamps cover only voiced frames and often end
+            # 0.5–2s before seg_end, leaving dead air.  Extend the last candidate
+            # to fill that gap so the active line stays visible until the next
+            # segment starts — gap bridging then takes over for the inter-segment
+            # transition.  Only applied when source has real acoustic data.
+            if candidates and source in ('word_boundary', 'char_boundary'):
+                last_end   = candidates[-1].get('end', 0.0)
+                seg_remain = seg_end - last_end
+                if seg_remain > _DRIFT_CORRECT_THRESH:
+                    corrected_end = round(seg_end, 3)
+                    if job_log:
+                        job_log.info(
+                            f"[drift] Seg{i}: last line ends {last_end:.3f}s, "
+                            f"seg_end={seg_end:.3f}s — "
+                            f"+{seg_remain*1000:.0f}ms drift correction applied",
+                            stage="transcribe",
+                        )
+                    candidates[-1]['end'] = corrected_end
+
+            # ── Log final chosen boundaries ───────────────────────────────────
+            if job_log:
+                for li, c in enumerate(candidates):
+                    dur  = c.get('end', 0.0) - c.get('start', 0.0)
+                    flag = ' ⚑SHORT' if dur < _MIN_LINE_DISPLAY_S else ''
+                    job_log.info(
+                        f"[boundary] Seg{i} line{li}: "
+                        f"{c.get('start', 0):.3f}–{c.get('end', 0):.3f}s "
+                        f"dur={dur:.3f}s src={source}{flag}  "
+                        f"'{c.get('text', '')[:32]}'",
+                        stage="transcribe",
+                    )
+
             for c in candidates:
                 c['_timing_source'] = source
             final.extend(candidates)
@@ -1290,6 +1459,19 @@ def _align_whisperx_with_official_lyrics(
             sil_src  = 'silence_split' if (n_unique > 1 or len(silence_lines) == 1) else 'proportional'
             for c in silence_lines:
                 c['_timing_source'] = sil_src
+
+            if job_log:
+                for li, c in enumerate(silence_lines):
+                    dur  = c.get('end', 0.0) - c.get('start', 0.0)
+                    flag = ' ⚑SHORT' if dur < _MIN_LINE_DISPLAY_S else ''
+                    job_log.info(
+                        f"[boundary] Seg{i} line{li}: "
+                        f"{c.get('start', 0):.3f}–{c.get('end', 0):.3f}s "
+                        f"dur={dur:.3f}s src={sil_src}{flag}  "
+                        f"'{c.get('text', '')[:32]}'",
+                        stage="transcribe",
+                    )
+
             final.extend(silence_lines)
             timing_sources[sil_src] += len(silence_lines)
             # Debug: record fallback lines
@@ -1315,6 +1497,9 @@ def _align_whisperx_with_official_lyrics(
             f"min={min(applied):.0f}ms max={max(applied):.0f}ms",
             stage="transcribe",
         )
+
+    # ── 5a. Boundary audit ───────────────────────────────────────────────────
+    _audit_boundaries(final, job_log)
 
     # ── 5. Bridge small gaps ──────────────────────────────────────────────────
     for i in range(len(final) - 1):
@@ -1364,6 +1549,150 @@ def _align_whisperx_with_official_lyrics(
         logger.debug("alignment_debug.json write failed: %s", _de)
 
     return final, "whisperx_official"
+
+
+# ── Pathological split detection ──────────────────────────────────────────────
+
+_SAFEGUARD_MIN_DUR_S      = 0.40   # any line shorter than this triggers rejection
+_SAFEGUARD_MAX_RATIO      = 8.0    # longest/shortest duration ratio ceiling
+_SAFEGUARD_MAX_1WORD_FRAC = 0.50   # max fraction of lines with ≤1 word token
+
+
+def _is_pathological_split(candidates: list[dict]) -> tuple[bool, str]:
+    """
+    Return (True, reason) when acoustic word-gap splitting produced unusable output.
+
+    Three independent checks — any one failing rejects the split:
+      1. Ultra-short line  — any duration < _SAFEGUARD_MIN_DUR_S
+      2. Extreme ratio     — max_dur / min_dur > _SAFEGUARD_MAX_RATIO
+      3. Single-word flood — > 50 % of lines have ≤ 1 word token
+
+    A rejected split falls back to proportional distribution so the song
+    never gets 0.02 s lines or one line swallowing 26 seconds.
+    """
+    if len(candidates) <= 1:
+        return False, ""
+
+    durations = [max(0.0, c.get('end', 0.0) - c.get('start', 0.0)) for c in candidates]
+    min_dur   = min(durations)
+    max_dur   = max(durations)
+
+    if min_dur < _SAFEGUARD_MIN_DUR_S:
+        return True, f"ultra-short line: min_dur={min_dur:.3f}s"
+
+    if min_dur > 0 and max_dur / min_dur > _SAFEGUARD_MAX_RATIO:
+        return True, (
+            f"extreme ratio: {max_dur:.2f}s/{min_dur:.2f}s "
+            f"= {max_dur/min_dur:.1f}× (limit {_SAFEGUARD_MAX_RATIO}×)"
+        )
+
+    n_sparse = sum(1 for c in candidates if len(c.get('words', [])) <= 1)
+    frac     = n_sparse / len(candidates)
+    if frac > _SAFEGUARD_MAX_1WORD_FRAC:
+        return True, (
+            f"too many 1-word lines: {n_sparse}/{len(candidates)} "
+            f"= {frac:.0%} (limit {_SAFEGUARD_MAX_1WORD_FRAC:.0%})"
+        )
+
+    return False, ""
+
+
+# ── Boundary audit ────────────────────────────────────────────────────────────
+
+_AUDIT_SHORT_MS   = 500    # flag lines shorter than this (ms)
+_AUDIT_GAP_S      = 2.0    # flag inter-line gaps larger than this (s)
+_AUDIT_DRIFT_TOL  = 0.01   # non-monotonic tolerance — ignore rounding noise (s)
+
+
+def _audit_boundaries(lines: list[dict], job_log) -> None:
+    """
+    Emit a compact per-line timing table and anomaly report after alignment.
+
+    Runs BEFORE gap-bridging so the raw acoustic boundaries are visible.
+    Each line is printed with:
+        L## start–end dur delta_from_prev src  text  [flags]
+
+    Flags:
+        ⚑NEGDUR   duration ≤ 0
+        ⚑SHORT    duration < _AUDIT_SHORT_MS ms
+        ⚑NONMONO  start < previous end (non-monotonic — root cause of drift)
+        ⚑OVERLAP  start < previous end by > tolerance (alias for severity)
+        ⚑GAP      gap to previous line > _AUDIT_GAP_S s
+
+    The FIRST non-monotonic line is marked ← FIRST_DRIFT.
+    """
+    if not job_log or not lines:
+        return
+
+    n = len(lines)
+    job_log.info(
+        f"[AUDIT] ══════ boundary audit: {n} lines ══════",
+        stage="align",
+    )
+
+    first_drift_idx: int      = -1
+    anomaly_lines:   list[int] = []
+    prev_end: float            = lines[0].get('start', 0.0)
+
+    for idx, line in enumerate(lines):
+        start = line.get('start', 0.0)
+        end   = line.get('end',   0.0)
+        dur   = end - start
+        delta = start - prev_end          # positive = gap, negative = overlap
+        src   = line.get('_timing_source', '?')[:14]
+        text  = line.get('text', '')[:30]
+
+        flags: list[str] = []
+
+        if dur <= 0:
+            flags.append('⚑NEGDUR')
+        elif dur < _AUDIT_SHORT_MS / 1000:
+            flags.append('⚑SHORT')
+
+        if idx > 0:
+            if delta < -_AUDIT_DRIFT_TOL:
+                flags.append('⚑NONMONO')
+                if first_drift_idx < 0:
+                    first_drift_idx = idx
+            if delta > _AUDIT_GAP_S:
+                flags.append('⚑GAP')
+
+        if flags:
+            anomaly_lines.append(idx)
+
+        drift_marker = '  ← FIRST_DRIFT' if idx == first_drift_idx else ''
+        flag_str     = ('  ' + ' '.join(flags)) if flags else ''
+        delta_str    = f"{delta * 1000:+.0f}ms" if idx > 0 else '    ---'
+
+        level = 'warning' if flags else 'info'
+        getattr(job_log, level)(
+            f"[AUDIT] L{idx:02d}  {start:.3f}–{end:.3f}s  "
+            f"dur={dur:.3f}s  prev_end={prev_end:.3f}s  Δ={delta_str:>8}  "
+            f"src={src:<14}  '{text}'"
+            f"{flag_str}{drift_marker}",
+            stage="align",
+        )
+
+        prev_end = end
+
+    # Summary
+    if anomaly_lines:
+        job_log.warning(
+            f"[AUDIT] {len(anomaly_lines)} anomalous line(s) at indices "
+            f"{anomaly_lines}"
+            + (f" — FIRST_DRIFT at L{first_drift_idx:02d}" if first_drift_idx >= 0 else ""),
+            stage="align",
+        )
+    else:
+        job_log.info(
+            f"[AUDIT] no anomalies — all {n} boundaries monotonic and well-formed",
+            stage="align",
+        )
+
+    job_log.info(
+        f"[AUDIT] ══════ end audit ══════",
+        stage="align",
+    )
 
 
 # ── Public entry point ─────────────────────────────────────────────────────────
