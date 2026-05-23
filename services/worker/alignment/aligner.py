@@ -1401,26 +1401,85 @@ def _align_whisperx_with_official_lyrics(
 
         if len(line_texts) > 1:
             if words:
-                # PRIMARY: word-gap boundary detection — acoustic, no char-ratio
-                candidates = _split_by_word_gaps(
-                    words, line_texts, eff_seg,
-                    job_log=job_log, seg_id=i,
+                # ── Detect character-level tokenization (Japanese) ─────────────
+                # When WhisperX tokenises at char level, end=next_start everywhere
+                # → all inter-token gaps are 0 ms.  Gap-based splitting is useless
+                # in that regime; jump straight to char progression.
+                _end_gaps = [
+                    (float(words[k+1].get('start', 0)) - float(words[k].get('end', 0))) * 1000
+                    for k in range(min(8, len(words) - 1))
+                    if words[k].get('end') is not None and words[k+1].get('start') is not None
+                ]
+                _is_char_level = (
+                    len(_end_gaps) >= 3 and
+                    max(_end_gaps) < _ZERO_GAP_THRESHOLD_MS
                 )
-                source = 'word_boundary'
 
-                # Safety check: reject pathological splits (ultra-short lines,
-                # extreme duration ratios, or mostly single-word allocations).
-                # These indicate word timestamps are too sparse or noisy to use.
-                bad, reason = _is_pathological_split(candidates)
-                if bad:
+                if _is_char_level:
+                    # PRIMARY (char-level): mora-weighted char START progression
                     if job_log:
-                        job_log.warning(
-                            f"[safeguard] Seg{i}: acoustic split rejected — {reason} "
-                            f"— falling back to proportional",
+                        job_log.info(
+                            f"[char_boundary] Seg{i}: char-level tokenisation "
+                            f"(max_end_gap={max(_end_gaps):.1f}ms, {len(words)} tokens) "
+                            f"— using mora-weighted progression",
                             stage="transcribe",
                         )
-                    candidates = _proportional_line(orig_seg, line_texts)
-                    source     = 'proportional'
+                    candidates = _split_by_char_progression(
+                        words, line_texts, eff_seg, i, job_log
+                    )
+                    source = 'char_boundary'
+
+                    # Safeguard on char result — fall back to proportional if still bad
+                    bad, reason = _is_pathological_split(candidates)
+                    if bad:
+                        if job_log:
+                            job_log.warning(
+                                f"[safeguard] Seg{i}: char progression rejected — {reason} "
+                                f"— falling back to proportional",
+                                stage="transcribe",
+                            )
+                        candidates = _proportional_line(orig_seg, line_texts)
+                        source     = 'proportional'
+
+                else:
+                    # PRIMARY (word-level): gap-based boundary detection
+                    candidates = _split_by_word_gaps(
+                        words, line_texts, eff_seg,
+                        job_log=job_log, seg_id=i,
+                    )
+                    source = 'word_boundary'
+
+                    # Safeguard: reject pathological splits
+                    bad, reason = _is_pathological_split(candidates)
+                    if bad:
+                        if job_log:
+                            job_log.warning(
+                                f"[safeguard] Seg{i}: word-gap split rejected — {reason} "
+                                f"— trying char_boundary",
+                                stage="transcribe",
+                            )
+                        # Try char progression before giving up on acoustic timing
+                        char_cands = _split_by_char_progression(
+                            words, line_texts, eff_seg, i, job_log
+                        )
+                        char_bad, char_reason = _is_pathological_split(char_cands)
+                        if not char_bad:
+                            candidates = char_cands
+                            source     = 'char_boundary'
+                            if job_log:
+                                job_log.info(
+                                    f"[char_boundary] Seg{i}: accepted after word-gap rejection",
+                                    stage="transcribe",
+                                )
+                        else:
+                            if job_log:
+                                job_log.warning(
+                                    f"[safeguard] Seg{i}: char progression also rejected "
+                                    f"({char_reason}) — falling back to proportional",
+                                    stage="transcribe",
+                                )
+                            candidates = _proportional_line(orig_seg, line_texts)
+                            source     = 'proportional'
             elif chars:
                 # SECONDARY: char-level CTC timestamps (no word data available)
                 char_cands = _boundary_from_chars(chars, line_texts, seg_start, seg_end)
@@ -1611,6 +1670,145 @@ def _align_whisperx_with_official_lyrics(
         logger.debug("alignment_debug.json write failed: %s", _de)
 
     return final, "whisperx_official"
+
+
+# ── Mora-weighted char-progression splitter ───────────────────────────────────
+#
+# WhisperX for Japanese produces CHARACTER-LEVEL tokens where:
+#   - end times = next token's start time  →  0 ms inter-token gaps
+#   - but start times represent real acoustic onsets
+#
+# Gap-based splitting is useless (all gaps 0 ms) but the START progression
+# is acoustically meaningful.  We map each lyric line's mora weight to a
+# fractional position in the character sequence and read the timestamp there.
+
+_SMALL_KANA = frozenset('ぁぃぅぇぉゃゅょゎァィゥェォャュョヮ')
+_ZERO_GAP_THRESHOLD_MS = 40   # max end→next-start gap to classify as char-level
+
+
+def _mora_count(text: str) -> int:
+    """
+    Estimate Japanese mora count for timing weight.
+
+    Moras are the primary timing unit in Japanese speech/singing.
+    Better weight than raw UTF-8 length when distributing line durations.
+
+      - Regular kana              → 1 mora each
+      - Small kana (ぁ etc.)      → 0 (they modify the preceding mora)
+      - Long vowel ー / wave 〜   → 1 mora
+      - Kanji                     → 2 moras (rough average)
+      - ASCII letters             → 1 per character (rough)
+      - Punctuation / whitespace  → 0
+    """
+    count = 0
+    for ch in unicodedata.normalize('NFKC', text):
+        cp = ord(ch)
+        if ch in _SMALL_KANA:
+            pass
+        elif 0x3041 <= cp <= 0x3096 or 0x30A1 <= cp <= 0x30F6:   # hiragana / katakana
+            count += 1
+        elif ch in ('ー', '〜'):                                   # long vowel
+            count += 1
+        elif 0x4E00 <= cp <= 0x9FFF or 0x3400 <= cp <= 0x4DBF:   # kanji
+            count += 2
+        elif ch.isascii() and ch.isalpha():
+            count += 1
+    return max(1, count)
+
+
+def _split_by_char_progression(
+    words:      list[dict],
+    line_texts: list[str],
+    parent_seg: dict,
+    seg_id:     int = -1,
+    job_log=None,
+) -> list[dict]:
+    """
+    Split lyric lines using cumulative character START timestamp progression.
+
+    Algorithm:
+      1. Compute mora weight for each lyric line.
+      2. Map cumulative mora fraction → index in the character sequence.
+      3. Read the char START timestamp at that index as the line boundary.
+
+    End time of each line = START time of the next line's first char (not
+    the current line's last char's END time, which equals the next char's
+    START anyway in char-level output).
+
+    Works for continuous Japanese singing where gap-based splitting fails.
+    """
+    n = len(line_texts)
+    if not words or n == 0:
+        return _proportional_line(parent_seg, line_texts)
+
+    if n == 1:
+        return [{
+            'text':  line_texts[0],
+            'start': round(float(words[0].get('start') or parent_seg.get('start', 0.0)), 3),
+            'end':   round(float(words[-1].get('end')  or parent_seg.get('end',   0.0)), 3),
+            'words': words,
+        }]
+
+    total_chars = len(words)
+    mora_counts = [max(1, _mora_count(t)) for t in line_texts]
+    total_moras = sum(mora_counts)
+
+    # Cumulative mora fraction → start index in char sequence
+    start_indices: list[int] = []
+    cumul = 0
+    for mc in mora_counts:
+        idx = min(int(cumul / total_moras * total_chars), total_chars - 1)
+        start_indices.append(idx)
+        cumul += mc
+
+    # Mean char spacing for diagnostics
+    ts = [float(w.get('start', 0)) for w in words if w.get('start') is not None]
+    mean_spacing_ms = (
+        (ts[-1] - ts[0]) / max(1, len(ts) - 1) * 1000 if len(ts) > 1 else 0
+    )
+
+    result: list[dict] = []
+    for li, (text, si) in enumerate(zip(line_texts, start_indices)):
+        ei      = start_indices[li + 1] if li + 1 < n else total_chars
+        grp     = words[si:ei]
+
+        start_t = float(words[si].get('start') or parent_seg.get('start', 0.0))
+        # End = start of next line's first char (acoustically more accurate than
+        # current last char's end, which is just next char's start anyway)
+        if li + 1 < n and start_indices[li + 1] < total_chars:
+            end_t = float(
+                words[start_indices[li + 1]].get('start')
+                or parent_seg.get('end', 0.0)
+            )
+        else:
+            end_t = float(words[-1].get('end') or parent_seg.get('end', 0.0))
+
+        result.append({
+            'text':  text,
+            'start': round(start_t, 3),
+            'end':   round(end_t,   3),
+            'words': grp,
+        })
+
+        if job_log:
+            job_log.info(
+                f"[char_boundary] Seg{seg_id} L{li}: "
+                f"{start_t:.3f}–{end_t:.3f}s "
+                f"dur={round(end_t-start_t,3):.3f}s "
+                f"chars={len(grp)} mora={mora_counts[li]} idx={si}  "
+                f"'{text[:30]}'",
+                stage="transcribe",
+            )
+
+    if job_log:
+        job_log.info(
+            f"[char_boundary] Seg{seg_id}: "
+            f"mean_char_spacing={mean_spacing_ms:.0f}ms  "
+            f"mora_weights={mora_counts}  total_chars={total_chars}",
+            stage="transcribe",
+        )
+
+    return result
 
 
 # ── Pathological split detection ──────────────────────────────────────────────
