@@ -98,7 +98,7 @@ def get_recent_logs(job_id: str, limit: int = 40) -> list[dict]:
     ]
 
 
-def get_best_logs(youtube_id: str, limit: int = 2000) -> list[dict]:
+def get_best_logs(youtube_id: str, limit: int = 5000) -> list[dict]:
     """
     Return logs from the most log-rich completed job for a youtube_id.
 

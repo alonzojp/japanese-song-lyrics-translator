@@ -136,7 +136,7 @@ async def get_job_endpoint(job_id: str) -> dict:
         raise HTTPException(status_code=404, detail="Job not found")
     # Return full log history for completed jobs so the frontend can persist them.
     # For in-progress jobs 40 is enough for the live panel without bloating polls.
-    log_limit = 2000 if job.status == JobStatus.completed else 40
+    log_limit = 5000 if job.status == JobStatus.completed else 40
     logs = get_recent_logs(job_id, limit=log_limit)
     return job.to_api(logs=logs)
 

@@ -620,6 +620,10 @@ export function KaraokePlayer({
         {artist && <p className="text-muted-foreground">{artist}</p>}
       </div>
 
+      {/* Log panel — shown during processing and persisted after completion */}
+      {isActive && job && <LogPanel logs={logs} />}
+      {isDone && completedLogs.length > 0 && <LogPanel logs={completedLogs} />}
+
       {/* Processing / status panel */}
       {!isDone && (
         <Card>
@@ -645,12 +649,9 @@ export function KaraokePlayer({
             )}
 
             {isActive && job ? (
-              <>
-                <div className="space-y-3">
-                  {job.steps.map((step) => <StepRow key={step.name} step={step} />)}
-                </div>
-                <LogPanel logs={logs} />
-              </>
+              <div className="space-y-3">
+                {job.steps.map((step) => <StepRow key={step.name} step={step} />)}
+              </div>
             ) : hasFailed ? (
               <div className="space-y-3">
                 <p className="text-sm text-destructive">
@@ -868,11 +869,6 @@ export function KaraokePlayer({
             </div>
           </CardContent>
         </Card>
-      )}
-
-      {/* Last run logs — visible after job completes */}
-      {isDone && completedLogs.length > 0 && (
-        <LogPanel logs={completedLogs} />
       )}
 
       {/* Selection tray (fixed bottom bar when items selected) */}
