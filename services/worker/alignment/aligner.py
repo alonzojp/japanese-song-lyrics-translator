@@ -1440,6 +1440,11 @@ def _align_whisperx_with_official_lyrics(
                             )
                         candidates = _proportional_line(orig_seg, line_texts)
                         source     = 'proportional'
+                    else:
+                        _log_token_map(candidates, i, job_log)
+                        _compare_splits(
+                            candidates, _proportional_line(orig_seg, line_texts), i, job_log
+                        )
 
                 else:
                     # PRIMARY (word-level): gap-based boundary detection
@@ -1471,6 +1476,10 @@ def _align_whisperx_with_official_lyrics(
                                     f"[char_boundary] Seg{i}: accepted after word-gap rejection",
                                     stage="transcribe",
                                 )
+                            _log_token_map(candidates, i, job_log)
+                            _compare_splits(
+                                candidates, _proportional_line(orig_seg, line_texts), i, job_log
+                            )
                         else:
                             if job_log:
                                 job_log.warning(
@@ -1790,12 +1799,22 @@ def _split_by_char_progression(
             'words': grp,
         })
 
+        # Confidence for char-boundary: based on chars-per-line density
+        # More chars per line = more stable boundary estimation
+        b_conf  = min(0.80, 0.30 + len(grp) / max(total_chars, 1) * 2.0)
+        b_label = 'char_dense' if b_conf >= 0.60 else 'char_sparse'
+
+        result[-1]['_boundary_conf']       = round(b_conf, 2)
+        result[-1]['_boundary_conf_label'] = b_label
+
         if job_log:
+            dur_flag = ' ⚑SHORT' if (end_t - start_t) < _MIN_LINE_DISPLAY_S else ''
             job_log.info(
                 f"[char_boundary] Seg{seg_id} L{li}: "
                 f"{start_t:.3f}–{end_t:.3f}s "
                 f"dur={round(end_t-start_t,3):.3f}s "
-                f"chars={len(grp)} mora={mora_counts[li]} idx={si}  "
+                f"chars={len(grp)} mora={mora_counts[li]} idx={si} "
+                f"bconf={b_conf:.2f}({b_label}){dur_flag}  "
                 f"'{text[:30]}'",
                 stage="transcribe",
             )
