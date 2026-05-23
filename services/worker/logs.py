@@ -100,20 +100,19 @@ def get_recent_logs(job_id: str, limit: int = 40) -> list[dict]:
 
 def get_best_logs(youtube_id: str, limit: int = 5000) -> list[dict]:
     """
-    Return logs from the most log-rich completed job for a youtube_id.
+    Return logs from the most recent meaningful job for a youtube_id.
 
-    Bypasses currentJobId — useful when the user re-submitted an instant-cache
-    job after a full run, which would otherwise hide the full diagnostic log.
+    Skips instant-cache jobs (< 20 entries) so a quick re-submit doesn't
+    hide the full diagnostic log from the actual alignment run.
     """
     conn = _conn()
     try:
         row = conn.execute(
-            """SELECT l.job_id, COUNT(l.id) as cnt
-               FROM job_logs l
-               JOIN jobs j ON j.id = l.job_id
+            """SELECT j.id
+               FROM jobs j
                WHERE j.youtube_id = ?
-               GROUP BY l.job_id
-               ORDER BY cnt DESC
+                 AND (SELECT COUNT(*) FROM job_logs l WHERE l.job_id = j.id) >= 20
+               ORDER BY j.created_at DESC
                LIMIT 1""",
             (youtube_id,),
         ).fetchone()
