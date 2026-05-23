@@ -63,14 +63,29 @@ const STEP_LABELS: Record<string, string> = {
 
 const POLL_MS = 1200;
 
-/** Binary search: return index of last line with startTime <= t, or 0. */
-function findLineFloor(lines: LyricLine[], t: number): number {
+/**
+ * Pure deterministic active-line lookup.
+ *
+ * Returns the index of the line whose [startTime, endTime] window contains t.
+ * Returns -1 if t is in a gap, before all lines, or after all lines.
+ *
+ * Algorithm: binary search to the floor candidate (last line with startTime ≤ t),
+ * then a single endTime check. O(log n). No state. Idempotent.
+ */
+function findActiveLine(lines: LyricLine[], t: number): number {
+  if (!lines.length) return -1;
+
+  // Binary search: find last index where startTime <= t
   let lo = 0, hi = lines.length - 1;
   while (lo < hi) {
     const mid = Math.ceil((lo + hi) / 2);
     if (lines[mid].startTime <= t) lo = mid; else hi = mid - 1;
   }
-  return lo;
+
+  // lo is now the candidate: last line whose start has been reached
+  if (lines[lo].startTime > t) return -1;           // t is before all lines
+  if (t <= lines[lo].endTime)  return lo;            // t is inside this line
+  return -1;                                         // t is in a gap after this line
 }
 
 // ── Step row ───────────────────────────────────────────────────────────────────
@@ -304,8 +319,6 @@ export function KaraokePlayer({
   const playerContainerRef = useRef<HTMLDivElement>(null);
   const timeIntervalRef    = useRef<ReturnType<typeof setInterval> | null>(null);
   const activeLineRef      = useRef<HTMLDivElement | null>(null);
-  // Advance-only index into sorted lyrics array. Reset on seek or lyrics change.
-  const currentLineIdxRef  = useRef<number>(0);
 
   // ── Vocab / selection state ───────────────────────────────────────────────────
   const [vocabState, setVocabState]         = useState<VocabState | null>(null);
@@ -321,39 +334,12 @@ export function KaraokePlayer({
   // lyrics is already sorted and finalized by the backend. No client-side mutations.
   const processedLyrics = lyrics;
 
-  // Stateful line index: advance forward during normal play, binary-search on seek.
-  // currentLineIdxRef is updated imperatively so it doesn't cause re-renders.
-  const activeIdx = useMemo(() => {
-    const lines = processedLyrics;
-    if (!lines.length) return -1;
-
-    // Advance forward past lines whose endTime has passed
-    while (
-      currentLineIdxRef.current < lines.length - 1 &&
-      currentTime > lines[currentLineIdxRef.current].endTime
-    ) {
-      currentLineIdxRef.current += 1;
-    }
-    // Retreat if we seeked backward
-    while (
-      currentLineIdxRef.current > 0 &&
-      currentTime < lines[currentLineIdxRef.current - 1].endTime &&
-      currentTime >= lines[currentLineIdxRef.current - 1].startTime
-    ) {
-      currentLineIdxRef.current -= 1;
-    }
-    // On large backward seek: binary search
-    if (
-      currentLineIdxRef.current > 0 &&
-      currentTime < lines[currentLineIdxRef.current].startTime - 5
-    ) {
-      currentLineIdxRef.current = findLineFloor(lines, currentTime);
-    }
-
-    const idx  = currentLineIdxRef.current;
-    const line = lines[idx];
-    return (currentTime >= line.startTime && currentTime <= line.endTime) ? idx : -1;
-  }, [currentTime, processedLyrics]);
+  // Pure time-based lookup — O(log n), stateless, deterministic.
+  // activeLine = f(currentTime, lyrics[]). No pointer, no advancement loops.
+  const activeIdx = useMemo(
+    () => findActiveLine(processedLyrics, currentTime),
+    [currentTime, processedLyrics],
+  );
 
   const activeLine = activeIdx >= 0 ? processedLyrics[activeIdx] : null;
 
@@ -372,7 +358,6 @@ export function KaraokePlayer({
       if (res.ok) {
         const { lines } = (await res.json()) as { lines: LyricLine[] };
         setLyrics(lines);
-        currentLineIdxRef.current = 0;
       }
     } finally {
       setIsSyncing(false);
