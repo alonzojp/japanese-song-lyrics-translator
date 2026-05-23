@@ -20,6 +20,7 @@ from cache import (
     cache_dir,
     cleanup_temp_files,
     get_metadata,
+    invalidate_stage,
     is_stage_complete,
     store_metadata,
 )
@@ -73,6 +74,20 @@ def run_job(job_id: str) -> None:
 
     set_job_status(job_id, JobStatus.processing)
     jl.info(f"Starting job {job_id[:8]}… youtube_id={yt_id}")
+
+    # Invalidate transcribe/align stages when aligned_words.json is stale.
+    # This must happen before all_stages_complete() so a version bump in
+    # ALIGNER_VERSION automatically triggers re-alignment on the next job
+    # without requiring a manual manifest clear.
+    from alignment.outputs import load_aligned_words, ALIGNER_VERSION
+    _aw_path = job_cache / "aligned_words.json"
+    if _aw_path.exists() and load_aligned_words(job_cache) is None:
+        jl.info(
+            f"Aligner version mismatch — invalidating transcribe/align cache "
+            f"(new version={ALIGNER_VERSION})"
+        )
+        invalidate_stage(yt_id, "transcribe")
+        invalidate_stage(yt_id, "align")
 
     if all_stages_complete(yt_id):
         if get_cached_lyrics(yt_id):

@@ -128,6 +128,13 @@ def get_metadata(youtube_id: str) -> dict:
     return get_manifest(youtube_id).get("metadata", {})
 
 
+def invalidate_stage(youtube_id: str, stage: str) -> None:
+    """Remove a stage from the manifest so it re-runs on the next job."""
+    manifest = get_manifest(youtube_id)
+    manifest.get("stages", {}).pop(stage, None)
+    _save(cache_dir(youtube_id) / MANIFEST_FILE, manifest)
+
+
 def all_stages_complete(youtube_id: str) -> bool:
     return all(is_stage_complete(youtube_id, s) for s in STAGES)
 
