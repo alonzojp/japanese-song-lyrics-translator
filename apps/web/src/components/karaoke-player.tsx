@@ -123,25 +123,33 @@ function LogPanel({ logs }: { logs: JobLogEntry[] }) {
   const userScrolledUpRef      = useRef(false);
 
   function copyLogs() {
-    const text = logs
-      .map((e) => `${new Date(e.ts).toLocaleTimeString()} [${e.stage ?? "—"}] ${e.message}`)
-      .join("\n");
-    const finish = () => { setCopied(true); setTimeout(() => setCopied(false), 2000); };
-    if (navigator.clipboard?.writeText) {
-      navigator.clipboard.writeText(text).then(finish).catch(() => fallbackCopy(text, finish));
-    } else {
-      fallbackCopy(text, finish);
+    try {
+      const text = logs
+        .map((e) => `${new Date(e.ts).toLocaleTimeString()} [${e.stage ?? "—"}] ${e.message}`)
+        .join("\n");
+      const finish = () => { setCopied(true); setTimeout(() => setCopied(false), 2000); };
+      if (typeof navigator !== "undefined" && navigator.clipboard?.writeText) {
+        navigator.clipboard.writeText(text).then(finish).catch(() => {
+          try { fallbackCopy(text, finish); } catch (_e) { /* silent */ }
+        });
+      } else {
+        try { fallbackCopy(text, finish); } catch (_e) { /* silent */ }
+      }
+    } catch (_e) {
+      /* silent — never crash the app over a copy failure */
     }
   }
 
   function fallbackCopy(text: string, onDone: () => void) {
     const el = document.createElement("textarea");
     el.value = text;
-    el.style.cssText = "position:fixed;opacity:0;pointer-events:none";
+    el.style.cssText = "position:fixed;top:-9999px;opacity:0;pointer-events:none";
     document.body.appendChild(el);
+    el.focus();
     el.select();
-    try { document.execCommand("copy"); onDone(); } catch { /* silent */ }
+    const ok = document.execCommand("copy");
     document.body.removeChild(el);
+    if (ok) onDone();
   }
 
   // Reset intent flag when panel opens so it starts pinned to bottom
