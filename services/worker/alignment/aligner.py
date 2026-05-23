@@ -32,8 +32,11 @@ _RMS_HOP_MS         = 50     # ms per RMS window for silence detection
 _MIN_SPLIT_SEP      = 1.0    # minimum seconds between detected split points
 _WORD_GAP_SPLIT_MS  = 120.0  # inter-word pause threshold for line boundary detection
 _MAX_CTC_LAG_S      = 3.0    # VAD anchor skipped when offset ≥ this (legitimate fill)
-_MIN_LINE_DISPLAY_S  = 0.25   # lines shorter than this are flagged and corrected
-_DRIFT_CORRECT_THRESH = 0.40  # extend last line if > this many seconds remain before seg_end
+_MIN_LINE_DISPLAY_S       = 0.25   # lines shorter than this are flagged and corrected
+_DRIFT_CORRECT_THRESH     = 0.40   # extend last line when this many seconds remain before seg_end
+_MAX_LINE_EXTENSION_MS    = 1200   # hard cap: never extend a line more than this beyond its acoustic end
+_INSTRUMENTAL_TAIL_MS     = 1800   # gaps beyond this are classified as instrumental tails
+_VOCAL_ENERGY_THRESHOLD   = 0.015  # RMS below this = silence/instrumental (no vocal)
 
 # ── Feature flags ─────────────────────────────────────────────────────────────
 # Phase 1: text-informed segment mapping (char bigrams + English anchors + greedy monotone).
@@ -1516,25 +1519,71 @@ def _align_whisperx_with_official_lyrics(
         )
 
         if valid:
-            # ── Intra-segment drift correction ────────────────────────────────
-            # WhisperX CTC timestamps cover only voiced frames and often end
-            # 0.5–2s before seg_end, leaving dead air.  Extend the last candidate
-            # to fill that gap so the active line stays visible until the next
-            # segment starts — gap bridging then takes over for the inter-segment
-            # transition.  Only applied when source has real acoustic data.
+            # ── Intra-segment tail guard + drift correction ────────────────────
+            # Small gaps (< _MAX_LINE_EXTENSION_MS) between the last acoustic
+            # line-end and seg_end are normal CTC lag — extend to cover them.
+            # Large gaps are instrumental tails — capping prevents a 26s lyric.
             if candidates and source in ('word_boundary', 'char_boundary'):
-                last_end   = candidates[-1].get('end', 0.0)
-                seg_remain = seg_end - last_end
-                if seg_remain > _DRIFT_CORRECT_THRESH:
-                    corrected_end = round(seg_end, 3)
-                    if job_log:
-                        job_log.info(
-                            f"[drift] Seg{i}: last line ends {last_end:.3f}s, "
-                            f"seg_end={seg_end:.3f}s — "
-                            f"+{seg_remain*1000:.0f}ms drift correction applied",
-                            stage="transcribe",
+                last_end     = candidates[-1].get('end', 0.0)
+                seg_remain   = seg_end - last_end
+                remain_ms    = seg_remain * 1000
+
+                if remain_ms > _DRIFT_CORRECT_THRESH * 1000:
+                    if remain_ms <= _MAX_LINE_EXTENSION_MS:
+                        # Small tail — safe to extend to seg_end
+                        candidates[-1]['end'] = round(seg_end, 3)
+                        if job_log:
+                            job_log.info(
+                                f"[drift] Seg{i}: +{remain_ms:.0f}ms correction "
+                                f"({last_end:.3f}s → {seg_end:.3f}s)",
+                                stage="transcribe",
+                            )
+                    else:
+                        # Large tail — check vocal energy before extending
+                        asr_path = audio_path.parent / 'vocals_asr.wav'
+                        probe_path = asr_path if asr_path.exists() else audio_path
+                        energy = _vocal_energy_in_window(
+                            probe_path, last_end,
+                            min(last_end + 1.0, seg_end)   # probe first 1s of tail
                         )
-                    candidates[-1]['end'] = corrected_end
+                        tail_type = (
+                            'instrumental_tail' if remain_ms > _INSTRUMENTAL_TAIL_MS
+                            else 'transition_gap'
+                        )
+
+                        if energy < _VOCAL_ENERGY_THRESHOLD:
+                            # Silence/instrumental — cap extension hard
+                            capped_end = round(last_end + _MAX_LINE_EXTENSION_MS / 1000, 3)
+                            candidates[-1]['end'] = capped_end
+                            if job_log:
+                                job_log.info(
+                                    f"[tail_guard] Seg{i}: {tail_type} "
+                                    f"+{remain_ms:.0f}ms, energy={energy:.4f} < threshold "
+                                    f"— capped at +{_MAX_LINE_EXTENSION_MS}ms "
+                                    f"({last_end:.3f}s → {capped_end:.3f}s)",
+                                    stage="transcribe",
+                                )
+                        else:
+                            # Vocal energy present — allow up to cap
+                            capped_end = round(
+                                min(seg_end, last_end + _MAX_LINE_EXTENSION_MS / 1000), 3
+                            )
+                            candidates[-1]['end'] = capped_end
+                            if job_log:
+                                job_log.info(
+                                    f"[tail_guard] Seg{i}: {tail_type} "
+                                    f"+{remain_ms:.0f}ms, energy={energy:.4f} (vocal present) "
+                                    f"— capped at +{_MAX_LINE_EXTENSION_MS}ms",
+                                    stage="transcribe",
+                                )
+
+                        if job_log:
+                            job_log.info(
+                                f"[instrumental_tail] Seg{i}: "
+                                f"tail={remain_ms:.0f}ms type={tail_type} "
+                                f"energy={energy:.4f}",
+                                stage="transcribe",
+                            )
 
             # ── Log final chosen boundaries ───────────────────────────────────
             if job_log:
@@ -1628,16 +1677,28 @@ def _align_whisperx_with_official_lyrics(
     # ── 5b. Boundary audit ───────────────────────────────────────────────────
     _audit_boundaries(final, job_log)
 
-    # ── 5. Bridge small gaps ──────────────────────────────────────────────────
+    # ── 5. Bridge inter-line gaps ─────────────────────────────────────────────
     for i in range(len(final) - 1):
         cur_end    = final[i].get('end',   0.0)
         next_start = final[i + 1].get('start', 0.0)
-        if 0 < next_start - cur_end:
-            # Bridge all gaps — standard karaoke behavior: keep the previous line
-            # visible until just before the next one starts, regardless of gap size.
-            # Acoustic timestamps correctly identify instrumental sections; without
-            # bridging, those sections show as dead zones with nothing highlighted.
+        gap_ms     = (next_start - cur_end) * 1000
+        if gap_ms <= 0:
+            continue
+        if gap_ms <= _MAX_LINE_EXTENSION_MS:
+            # Small gap — bridge normally for smooth karaoke flow
             final[i]['end'] = round(next_start - 0.05, 3)
+        else:
+            # Large gap (instrumental section) — cap extension, do not absorb
+            capped = round(cur_end + _MAX_LINE_EXTENSION_MS / 1000, 3)
+            final[i]['end'] = min(capped, round(next_start - 0.05, 3))
+            if job_log:
+                job_log.info(
+                    f"[tail_guard] line{i}: gap={gap_ms:.0f}ms > {_MAX_LINE_EXTENSION_MS}ms "
+                    f"— capped bridge at +{_MAX_LINE_EXTENSION_MS}ms "
+                    f"(acoustic {cur_end:.3f}s → capped {final[i]['end']:.3f}s, "
+                    f"next starts {next_start:.3f}s)",
+                    stage="transcribe",
+                )
 
     # ── 6. Summary metrics ────────────────────────────────────────────────────
     n_total    = max(1, len(final))
@@ -1668,6 +1729,9 @@ def _align_whisperx_with_official_lyrics(
                 "[align] No acoustic boundaries found — all lines are proportional estimates",
                 stage="transcribe",
             )
+
+    # ── Karaoke health check ─────────────────────────────────────────────────
+    _karaoke_health_check(final, job_log)
 
     # ── Sanity validation ─────────────────────────────────────────────────────
     _sanity_validate(final, job_log)
@@ -1876,6 +1940,31 @@ def _is_pathological_split(candidates: list[dict]) -> tuple[bool, str]:
     return False, ""
 
 
+# ── Vocal energy probe ────────────────────────────────────────────────────────
+
+def _vocal_energy_in_window(audio_path: Path, start: float, end: float) -> float:
+    """
+    Return mean RMS energy in [start, end] of the ASR audio (0–1 scale).
+    Values below _VOCAL_ENERGY_THRESHOLD indicate silence / instrumental.
+    Returns 0.5 (conservative) if audio cannot be read.
+    """
+    if end <= start:
+        return 0.0
+    try:
+        import soundfile as sf
+        import numpy as np
+        info     = sf.info(str(audio_path))
+        sr       = info.samplerate
+        s_frame  = int(start * sr)
+        n_frames = max(1, int((end - start) * sr))
+        audio, _ = sf.read(str(audio_path), start=s_frame, frames=n_frames, dtype='float32')
+        if audio.ndim > 1:
+            audio = audio.mean(axis=1)
+        return float(np.sqrt(np.mean(audio ** 2) + 1e-9))
+    except Exception:
+        return 0.5   # can't read → conservative, don't block extension
+
+
 # ── Deep observability helpers ────────────────────────────────────────────────
 
 def _split_quality_metrics(candidates: list[dict]) -> dict:
@@ -2059,6 +2148,94 @@ def _log_drift_curve(
             f"{drift_ms:+.0f}ms  cumul={cumul:+.0f}ms{flag}",
             stage="transcribe",
         )
+
+
+def _karaoke_health_check(lines: list[dict], job_log) -> None:
+    """
+    [karaoke_health] End-to-end sanity check for karaoke playback quality.
+
+    Emits a scored summary with per-metric flags so the logs tell you at a
+    glance whether the output is ready for display or needs investigation.
+    Does NOT modify lines — diagnostic only.
+    """
+    if not job_log or not lines:
+        return
+
+    n = len(lines)
+    durs = [max(0.0, l.get('end', 0) - l.get('start', 0)) for l in lines]
+    gaps = [
+        lines[i].get('start', 0) - lines[i - 1].get('end', 0)
+        for i in range(1, n)
+    ]
+
+    # ── Per-metric counts ────────────────────────────────────────────────────
+    n_short      = sum(1 for d in durs if d < _MIN_LINE_DISPLAY_S)
+    n_very_long  = sum(1 for d in durs if d > 15.0)
+    n_long       = sum(1 for d in durs if 8.0 < d <= 15.0)
+    n_big_gap    = sum(1 for g in gaps if g > 5.0)
+    n_overlap    = sum(1 for g in gaps if g < -0.01)
+    max_dur      = max(durs) if durs else 0.0
+    total_vocal  = sum(durs)
+
+    # Lines whose duration exceeds the cap (tail guard should have caught these)
+    n_tail_viol  = sum(
+        1 for i in range(n - 1)
+        if (lines[i].get('end', 0) - lines[i].get('_acoustic_end', lines[i].get('end', 0))) * 1000
+           > _MAX_LINE_EXTENSION_MS + 50  # 50ms tolerance
+    )
+
+    # Timing source breakdown
+    sources: dict[str, int] = {}
+    for ln in lines:
+        src = ln.get('_timing_source', 'unknown')
+        sources[src] = sources.get(src, 0) + 1
+    acoustic = sources.get('char_boundary', 0) + sources.get('word_boundary', 0)
+    acoustic_pct = int(100 * acoustic / n) if n else 0
+
+    # ── Score (0–100) ────────────────────────────────────────────────────────
+    score = 100
+    flags: list[str] = []
+
+    if n_short:
+        score -= min(20, n_short * 4)
+        flags.append(f"{n_short} short(<{_MIN_LINE_DISPLAY_S}s)")
+    if n_very_long:
+        score -= min(30, n_very_long * 15)
+        flags.append(f"{n_very_long} very-long(>15s)")
+    if n_long:
+        score -= min(10, n_long * 3)
+        flags.append(f"{n_long} long(>8s)")
+    if n_big_gap:
+        score -= min(10, n_big_gap * 3)
+        flags.append(f"{n_big_gap} big-gap(>5s)")
+    if n_overlap:
+        score -= min(20, n_overlap * 5)
+        flags.append(f"{n_overlap} overlaps")
+    if acoustic_pct < 60:
+        score -= (60 - acoustic_pct) // 3
+        flags.append(f"acoustic_pct={acoustic_pct}%")
+
+    score = max(0, score)
+    grade = "EXCELLENT" if score >= 90 else "GOOD" if score >= 75 else "FAIR" if score >= 55 else "POOR"
+
+    job_log.info(
+        f"[karaoke_health] score={score}/100 ({grade}) | "
+        f"lines={n} acoustic={acoustic_pct}% "
+        f"max_dur={max_dur:.1f}s total_vocal={total_vocal:.1f}s"
+        + (f" | flags: {', '.join(flags)}" if flags else " | no issues"),
+        stage="align",
+    )
+
+    # Per-line detail for any very-long lines
+    for i, (ln, d) in enumerate(zip(lines, durs)):
+        if d > 8.0:
+            src  = ln.get('_timing_source', '?')
+            text = (ln.get('text') or '')[:30]
+            job_log.info(
+                f"[karaoke_health] long line{i}: {ln.get('start', 0):.3f}–{ln.get('end', 0):.3f}s "
+                f"dur={d:.1f}s src={src} '{text}'",
+                stage="align",
+            )
 
 
 def _sanity_validate(lines: list[dict], job_log) -> bool:
