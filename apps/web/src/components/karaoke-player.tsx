@@ -1,5 +1,10 @@
 "use client";
 
+// ── Build identity ─────────────────────────────────────────────────────────────
+// Bump this string whenever playback logic changes so you can verify the
+// deployed version in DevTools → Console without reading minified bundles.
+const PLAYBACK_BUILD = "2026-05-23 pure-bsearch-v1";
+
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   Play, Pause, Loader2, CheckCircle2, XCircle, Zap,
@@ -468,6 +473,11 @@ export function KaraokePlayer({
       ytPlayerRef.current = null;
     };
   }, [youtubeId]);
+
+  // ── Build identity (check in DevTools → Console) ─────────────────────────────
+  useEffect(() => {
+    console.log(`[karaoke] playback build: ${PLAYBACK_BUILD}`);
+  }, []);
 
   // ── Auto-scroll active lyric into view ────────────────────────────────────────
 
