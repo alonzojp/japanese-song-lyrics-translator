@@ -63,6 +63,8 @@ def run_transcription(
         return _cb
 
     # ── Full cache hit ─────────────────────────────────────────────────────────
+    # load_aligned_words performs a version check — returns None when the cached
+    # file was written by an older aligner version, forcing a fresh alignment run.
     if is_stage_complete(youtube_id, "transcribe"):
         loaded = load_aligned_words(output_dir)
         if loaded:
@@ -71,6 +73,8 @@ def run_transcription(
             if progress_cb:
                 progress_cb(100)
             return segs, "cached", method
+        # Version mismatch: fall through to re-run alignment
+        log("Aligner version mismatch — re-running forced alignment")
 
     # ── 3a: Audio prep (0–20 %) ────────────────────────────────────────────────
     log("Preparing audio for ASR …")
