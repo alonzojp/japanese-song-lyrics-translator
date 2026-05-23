@@ -1,0 +1,15 @@
+{
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "changes=$(git -C \"C:/Users/alonz/Documents/Claude Projects/japanese-song-lyrics-translator\" status --short 2>/dev/null); if [ -n \"$changes\" ]; then printf '{\"hookSpecificOutput\":{\"hookEventName\":\"Stop\",\"additionalContext\":\"UNCOMMITTED CHANGES DETECTED - commit and push before finishing:\\n%s\"}}' \"$changes\"; fi",
+            "shell": "bash"
+          }
+        ]
+      }
+    ]
+  }
+}
