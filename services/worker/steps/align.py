@@ -27,6 +27,7 @@ from alignment import (
     save_alignment_meta,
 )
 from alignment.onset import measure_and_log as measure_onset
+from alignment.visual_timing import visual_timing_normalization, visual_timing_quality
 from cache import is_stage_complete, mark_stage_complete
 from config import WHISPER_MODEL
 
@@ -92,6 +93,12 @@ def run_alignment_postprocess(
         message_cb("Building lyric lines…")
     lines = build_lyric_lines(aligned_segments, line_confidences=conf.line_confidences)
     log(f"Built {len(lines)} LyricLine objects")
+
+    # ── Visual timing normalization ────────────────────────────────────────────
+    if message_cb:
+        message_cb("Normalizing visual timing…")
+    visual_timing_normalization(lines, job_log=job_log)
+    visual_timing_quality(lines, job_log=job_log)
 
     if progress_cb:
         progress_cb(60)

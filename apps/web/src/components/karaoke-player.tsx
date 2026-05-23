@@ -61,9 +61,13 @@ const STEP_LABELS: Record<string, string> = {
   align:      "Align timestamps",
 };
 
-const POLL_MS    = 1200;
-const LEAD_IN_S  = 1.2;    // show next line N seconds before its acoustic start
-const LINGER_S   = 0.35;   // keep previous line visible for N seconds after transition
+const POLL_MS   = 1200;
+const LEAD_IN_S = 1.0;   // show next line this many seconds before its display start
+const LINGER_S  = 0.25;  // keep previous line visible for N seconds after transition
+
+// Use displayStart/displayEnd when present (visual timing), else fall back to acoustic.
+function dStart(l: LyricLine) { return l.displayStart ?? l.startTime; }
+function dEnd(l: LyricLine)   { return l.displayEnd   ?? l.endTime;   }
 
 // ── Step row ───────────────────────────────────────────────────────────────────
 
@@ -308,48 +312,51 @@ export function KaraokePlayer({
   // ── Derived ───────────────────────────────────────────────────────────────────
   const hasTokens  = lyrics.some((l) => l.tokens && l.tokens.length > 0);
 
-  // Clamp endTimes so no line extends past the next line's start.
-  // This eliminates DTW-produced overlaps before any display logic sees them.
+  // Build display-time-clamped lyrics.
+  // Prefer displayStart/displayEnd (visual timing from backend normalization).
+  // Clamp displayEnd so no line visually overlaps the next line's display start.
   const processedLyrics = useMemo(() =>
     lyrics.map((line, i) => {
-      const nextStart  = lyrics[i + 1]?.startTime;
-      const clampedEnd = nextStart !== undefined
-        ? Math.min(line.endTime, nextStart - 0.05)
-        : line.endTime;
+      const nextLine    = lyrics[i + 1];
+      const nextDStart  = nextLine ? dStart(nextLine) : undefined;
+      const rawEnd      = dEnd(line);
+      const clampedEnd  = nextDStart !== undefined
+        ? Math.min(rawEnd, nextDStart - 0.05)
+        : rawEnd;
       if (process.env.NODE_ENV !== "production") {
-        const dur = clampedEnd - line.startTime;
-        if (dur > 12) {
+        const dur = clampedEnd - dStart(line);
+        if (dur > 8) {
           console.warn(
             `LONG_LINE_WARNING: line ${i} "${line.text.slice(0, 30)}" ` +
-            `visual_duration=${dur.toFixed(1)}s (raw_end=${line.endTime.toFixed(3)})`
+            `display_duration=${dur.toFixed(1)}s`,
           );
         }
       }
-      return clampedEnd === line.endTime ? line : { ...line, endTime: clampedEnd };
+      // Attach clamped display end so downstream logic reads it uniformly
+      return clampedEnd === rawEnd ? line : { ...line, displayEnd: clampedEnd };
     }),
     [lyrics],
   );
 
-  // Active line: last line whose clamped window contains currentTime.
-  // reduce() scans all lines so the highest-index match wins — handles any residual overlap.
+  // Active line: last line whose display window contains currentTime.
   const activeIdx = processedLyrics.reduce<number>(
     (best, l, i) =>
-      currentTime >= l.startTime && currentTime <= l.endTime ? i : best,
+      currentTime >= dStart(l) && currentTime <= dEnd(l) ? i : best,
     -1,
   );
   const activeLine = activeIdx >= 0 ? processedLyrics[activeIdx] : null;
 
-  // Incoming line: the next line, shown early to give the learner a reading head-start.
+  // Incoming line: next line, shown LEAD_IN_S before its display start.
   const incomingLine: LyricLine | null =
     activeIdx >= 0 && activeIdx + 1 < processedLyrics.length &&
-    currentTime >= processedLyrics[activeIdx + 1].startTime - LEAD_IN_S
+    currentTime >= dStart(processedLyrics[activeIdx + 1]) - LEAD_IN_S
       ? processedLyrics[activeIdx + 1]
       : null;
 
-  // Lingering line: the previous line, briefly kept visible after a transition.
+  // Lingering line: previous line, briefly kept after transition.
   const lingeringLine: LyricLine | null =
     activeIdx > 0 && activeLine &&
-    currentTime < activeLine.startTime + LINGER_S
+    currentTime < dStart(activeLine) + LINGER_S
       ? processedLyrics[activeIdx - 1]
       : null;
 
