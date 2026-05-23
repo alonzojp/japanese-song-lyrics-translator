@@ -69,14 +69,93 @@ def _compression_strength(ratio: float) -> float:
     else:              return 0.95
 
 
-def _last_word_end(line: dict) -> float | None:
-    words = line.get('words')
-    if not words:
-        return None
-    end = words[-1].get('end')
-    if end is None or float(end) <= 0:
-        return None
-    return float(end)
+def pick_best_anchor(
+    line:      dict,
+    next_line: dict | None = None,
+) -> tuple[float, str]:
+    """
+    Choose the best end-anchor for a lyric line.
+
+    Returns (anchor_end, source_label).
+
+    Candidates (in preference order):
+      1. last_word.end      — primary; excluded if unreliably early or overlapping
+      2. second_last_word.end — fallback when last word is a short unstable token
+      3. segment_end (acousticEnd) — last resort when word timestamps are absent/bad
+
+    Scoring criteria (all deterministic):
+      - Overlap penalty: candidate > next_line.startTime - 0.05  →  disqualified
+      - Minimum coverage: candidate < a_start + VIS_MIN_S        →  disqualified
+      - Recency penalty: large gap between candidate and acousticEnd = under-coverage
+      - Stability bonus: second_last preferred over last when last is suspiciously
+        short (< 150ms duration), which indicates a WhisperX boundary artifact
+    """
+    words    = line.get('words') or []
+    a_start  = float(line.get('acousticStart', line.get('startTime', 0)))
+    a_end    = float(line.get('acousticEnd',   line.get('endTime',   0)))
+    next_start = float(next_line.get('startTime', a_end + 99.0)) if next_line else a_end + 99.0
+
+    # Hard ceiling: anchor must not cross into next line
+    overlap_ceiling = next_start - 0.05
+
+    def valid(t: float) -> bool:
+        return (
+            t > a_start + _VIS_MIN_S * 0.5   # not absurdly early
+            and t <= overlap_ceiling          # doesn't overlap next line
+            and t <= a_end + 0.1              # doesn't exceed acoustic end by much
+        )
+
+    def score(t: float) -> float:
+        """Higher = better. All terms are deterministic."""
+        s = 0.0
+        # Reward closeness to acousticEnd (up to 0 penalty at a_end)
+        # Each 100ms away from a_end costs 1 point — prevents early cutoffs
+        s -= abs(a_end - t) * 10.0
+        # Reward being safely before next line
+        margin = overlap_ceiling - t
+        if margin < 0.3:
+            s -= (0.3 - margin) * 20.0   # heavy penalty for tight margin
+        return s
+
+    # Build candidate list: (timestamp, label, bonus)
+    # Bonus rewards word-based anchors over segment fallback
+    candidates: list[tuple[float, str, float]] = []
+
+    if len(words) >= 1:
+        last_end = words[-1].get('end')
+        if last_end is not None:
+            last_end = float(last_end)
+            # Detect unstable last token: very short duration (< 150ms)
+            last_start = float(words[-1].get('start', last_end))
+            last_dur   = last_end - last_start
+            stability_bonus = 0.0 if last_dur >= 0.15 else -5.0
+            if valid(last_end):
+                candidates.append((last_end, 'last_word', 8.0 + stability_bonus))
+
+    if len(words) >= 2:
+        sl_end = words[-2].get('end')
+        if sl_end is not None:
+            sl_end = float(sl_end)
+            if valid(sl_end):
+                # Second-last is preferred only when last word is unstable —
+                # give it a baseline bonus below stable last_word
+                candidates.append((sl_end, 'second_last_word', 3.0))
+
+    # Segment end is always a candidate (last resort)
+    if valid(a_end):
+        candidates.append((a_end, 'segment_end', 0.0))
+    elif candidates:
+        pass   # segment_end invalid (overlaps next line); word candidates cover it
+    else:
+        # Nothing valid — return segment end clamped to overlap ceiling
+        return (min(a_end, overlap_ceiling), 'segment_end_clamped')
+
+    if not candidates:
+        return (min(a_end, overlap_ceiling), 'segment_end_clamped')
+
+    # Pick highest (base_bonus + continuity_score)
+    best = max(candidates, key=lambda c: c[2] + score(c[0]))
+    return (best[0], best[1])
 
 
 # ── Phase 1: visual normalization ─────────────────────────────────────────────
@@ -105,15 +184,11 @@ def visual_timing_normalization(lines: list[dict], job_log=None) -> list[dict]:
         line['acousticStart'] = round(a_start, 3)
         line['acousticEnd']   = round(a_end,   3)
 
-        # ── Timing anchor: prefer last word boundary ─────────────────────
-        last_word = _last_word_end(line)
-        if last_word is not None and a_start <= last_word <= a_end:
-            anchor_end = last_word
-            anchor_src = 'word'
+        # ── Timing anchor: scored multi-candidate selection ──────────────
+        next_line  = lines[i + 1] if i + 1 < n else None
+        anchor_end, anchor_src = pick_best_anchor(line, next_line)
+        if 'word' in anchor_src:
             n_word_anchored += 1
-        else:
-            anchor_end = a_end
-            anchor_src = 'segment'
 
         anchor_dur = max(0.0, anchor_end - a_start)
 
