@@ -23,7 +23,7 @@ LYRICS_FILE         = "lyrics.json"
 
 # Bump this string whenever alignment logic changes so stale aligned_words.json
 # files are automatically rejected and force_align() re-runs.
-ALIGNER_VERSION = "10"
+ALIGNER_VERSION = "11"
 
 
 def save_transcript(output_dir: Path, segments: list[dict], backend: str) -> Path:

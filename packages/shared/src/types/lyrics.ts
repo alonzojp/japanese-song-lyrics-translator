@@ -12,11 +12,11 @@ export interface WordTiming {
 export interface LyricLine {
   id:         string;        // "line-0", "line-1" …
   text:       string;
-  startTime:  number;        // acoustic start — do NOT use for display
-  endTime:    number;        // acoustic end   — do NOT use for display
-  /** Visual timing — use these for karaoke highlighting when present. */
-  displayStart?: number;
-  displayEnd?:   number;
+  startTime:  number;        // finalized display start — use for highlighting
+  endTime:    number;        // finalized display end   — use for highlighting
+  /** Original acoustic boundaries, preserved for diagnostics only. */
+  acousticStart?: number;
+  acousticEnd?:   number;
   words?:     WordTiming[];
   /** 0.0–1.0 alignment confidence for this specific line */
   confidence?: number;

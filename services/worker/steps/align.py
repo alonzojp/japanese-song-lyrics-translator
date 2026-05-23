@@ -27,7 +27,7 @@ from alignment import (
     save_alignment_meta,
 )
 from alignment.onset import measure_and_log as measure_onset
-from alignment.visual_timing import visual_timing_normalization, visual_timing_quality
+from alignment.visual_timing import visual_timing_normalization, finalize_timeline, timeline_quality
 from cache import is_stage_complete, mark_stage_complete
 from config import WHISPER_MODEL
 
@@ -94,11 +94,14 @@ def run_alignment_postprocess(
     lines = build_lyric_lines(aligned_segments, line_confidences=conf.line_confidences)
     log(f"Built {len(lines)} LyricLine objects")
 
-    # ── Visual timing normalization ────────────────────────────────────────────
+    # ── Visual timing normalization → timeline finalization ───────────────────
+    # Phase 1: overwrite startTime/endTime with display-optimised values.
+    # Phase 2: enforce monotonicity and lock the timeline (immutable after this).
     if message_cb:
-        message_cb("Normalizing visual timing…")
+        message_cb("Finalizing display timeline…")
     visual_timing_normalization(lines, job_log=job_log)
-    visual_timing_quality(lines, job_log=job_log)
+    finalize_timeline(lines, job_log=job_log)
+    timeline_quality(lines, job_log=job_log)
 
     if progress_cb:
         progress_cb(60)

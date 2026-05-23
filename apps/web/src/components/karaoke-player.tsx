@@ -61,13 +61,17 @@ const STEP_LABELS: Record<string, string> = {
   align:      "Align timestamps",
 };
 
-const POLL_MS   = 1200;
-const LEAD_IN_S = 1.0;   // show next line this many seconds before its display start
-const LINGER_S  = 0.25;  // keep previous line visible for N seconds after transition
+const POLL_MS = 1200;
 
-// Use displayStart/displayEnd when present (visual timing), else fall back to acoustic.
-function dStart(l: LyricLine) { return l.displayStart ?? l.startTime; }
-function dEnd(l: LyricLine)   { return l.displayEnd   ?? l.endTime;   }
+/** Binary search: return index of last line with startTime <= t, or 0. */
+function findLineFloor(lines: LyricLine[], t: number): number {
+  let lo = 0, hi = lines.length - 1;
+  while (lo < hi) {
+    const mid = Math.ceil((lo + hi) / 2);
+    if (lines[mid].startTime <= t) lo = mid; else hi = mid - 1;
+  }
+  return lo;
+}
 
 // ── Step row ───────────────────────────────────────────────────────────────────
 
@@ -296,10 +300,12 @@ export function KaraokePlayer({
   const pollRef                         = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // ── YouTube player refs ───────────────────────────────────────────────────────
-  const ytPlayerRef       = useRef<YTPlayer | null>(null);
+  const ytPlayerRef        = useRef<YTPlayer | null>(null);
   const playerContainerRef = useRef<HTMLDivElement>(null);
-  const timeIntervalRef   = useRef<ReturnType<typeof setInterval> | null>(null);
-  const activeLineRef     = useRef<HTMLDivElement | null>(null);
+  const timeIntervalRef    = useRef<ReturnType<typeof setInterval> | null>(null);
+  const activeLineRef      = useRef<HTMLDivElement | null>(null);
+  // Advance-only index into sorted lyrics array. Reset on seek or lyrics change.
+  const currentLineIdxRef  = useRef<number>(0);
 
   // ── Vocab / selection state ───────────────────────────────────────────────────
   const [vocabState, setVocabState]         = useState<VocabState | null>(null);
@@ -312,53 +318,44 @@ export function KaraokePlayer({
   // ── Derived ───────────────────────────────────────────────────────────────────
   const hasTokens  = lyrics.some((l) => l.tokens && l.tokens.length > 0);
 
-  // Build display-time-clamped lyrics.
-  // Prefer displayStart/displayEnd (visual timing from backend normalization).
-  // Clamp displayEnd so no line visually overlaps the next line's display start.
-  const processedLyrics = useMemo(() =>
-    lyrics.map((line, i) => {
-      const nextLine    = lyrics[i + 1];
-      const nextDStart  = nextLine ? dStart(nextLine) : undefined;
-      const rawEnd      = dEnd(line);
-      const clampedEnd  = nextDStart !== undefined
-        ? Math.min(rawEnd, nextDStart - 0.05)
-        : rawEnd;
-      if (process.env.NODE_ENV !== "production") {
-        const dur = clampedEnd - dStart(line);
-        if (dur > 8) {
-          console.warn(
-            `LONG_LINE_WARNING: line ${i} "${line.text.slice(0, 30)}" ` +
-            `display_duration=${dur.toFixed(1)}s`,
-          );
-        }
-      }
-      // Attach clamped display end so downstream logic reads it uniformly
-      return clampedEnd === rawEnd ? line : { ...line, displayEnd: clampedEnd };
-    }),
-    [lyrics],
-  );
+  // lyrics is already sorted and finalized by the backend. No client-side mutations.
+  const processedLyrics = lyrics;
 
-  // Active line: last line whose display window contains currentTime.
-  const activeIdx = processedLyrics.reduce<number>(
-    (best, l, i) =>
-      currentTime >= dStart(l) && currentTime <= dEnd(l) ? i : best,
-    -1,
-  );
+  // Stateful line index: advance forward during normal play, binary-search on seek.
+  // currentLineIdxRef is updated imperatively so it doesn't cause re-renders.
+  const activeIdx = useMemo(() => {
+    const lines = processedLyrics;
+    if (!lines.length) return -1;
+
+    // Advance forward past lines whose endTime has passed
+    while (
+      currentLineIdxRef.current < lines.length - 1 &&
+      currentTime > lines[currentLineIdxRef.current].endTime
+    ) {
+      currentLineIdxRef.current += 1;
+    }
+    // Retreat if we seeked backward
+    while (
+      currentLineIdxRef.current > 0 &&
+      currentTime < lines[currentLineIdxRef.current - 1].endTime &&
+      currentTime >= lines[currentLineIdxRef.current - 1].startTime
+    ) {
+      currentLineIdxRef.current -= 1;
+    }
+    // On large backward seek: binary search
+    if (
+      currentLineIdxRef.current > 0 &&
+      currentTime < lines[currentLineIdxRef.current].startTime - 5
+    ) {
+      currentLineIdxRef.current = findLineFloor(lines, currentTime);
+    }
+
+    const idx  = currentLineIdxRef.current;
+    const line = lines[idx];
+    return (currentTime >= line.startTime && currentTime <= line.endTime) ? idx : -1;
+  }, [currentTime, processedLyrics]);
+
   const activeLine = activeIdx >= 0 ? processedLyrics[activeIdx] : null;
-
-  // Incoming line: next line, shown LEAD_IN_S before its display start.
-  const incomingLine: LyricLine | null =
-    activeIdx >= 0 && activeIdx + 1 < processedLyrics.length &&
-    currentTime >= dStart(processedLyrics[activeIdx + 1]) - LEAD_IN_S
-      ? processedLyrics[activeIdx + 1]
-      : null;
-
-  // Lingering line: previous line, briefly kept after transition.
-  const lingeringLine: LyricLine | null =
-    activeIdx > 0 && activeLine &&
-    currentTime < dStart(activeLine) + LINGER_S
-      ? processedLyrics[activeIdx - 1]
-      : null;
 
   const isActive    = jobStatus === "queued" || jobStatus === "processing";
   const isDone      = jobStatus === "completed";
@@ -375,6 +372,7 @@ export function KaraokePlayer({
       if (res.ok) {
         const { lines } = (await res.json()) as { lines: LyricLine[] };
         setLyrics(lines);
+        currentLineIdxRef.current = 0;
       }
     } finally {
       setIsSyncing(false);
@@ -835,9 +833,7 @@ export function KaraokePlayer({
           <CardContent>
             <div className="space-y-1">
               {processedLyrics.map((line) => {
-                const isCurrentLine  = activeLine?.id   === line.id;
-                const isNextLine     = incomingLine?.id === line.id;
-                const isPreviousLine = lingeringLine?.id === line.id;
+                const isCurrentLine = activeLine?.id === line.id;
 
                 return (
                   <div
@@ -846,10 +842,6 @@ export function KaraokePlayer({
                     className={`rounded-lg px-4 py-3 transition-all duration-300 ${
                       isCurrentLine
                         ? "bg-primary/20 ring-1 ring-primary/30"
-                        : isNextLine
-                        ? "bg-primary/10 ring-1 ring-primary/15 opacity-75"
-                        : isPreviousLine
-                        ? "bg-primary/8 opacity-40"
                         : "hover:bg-muted"
                     }`}
                   >
@@ -871,9 +863,7 @@ export function KaraokePlayer({
                       </p>
                     ) : (
                       <p className={`font-japanese text-lg leading-loose ${
-                        isCurrentLine ? "text-foreground" :
-                        isNextLine    ? "text-foreground/70" :
-                        "text-foreground/70"
+                        isCurrentLine ? "text-foreground" : "text-foreground/70"
                       }`}>
                         {line.text}
                       </p>
