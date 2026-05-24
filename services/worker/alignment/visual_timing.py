@@ -86,6 +86,14 @@ _NO_WORDS_SHORT_THRESH  = 8      # mora ≤ this → short wordless line gets a 
 _NO_WORDS_SHORT_FLOOR   = 0.68   # sec/mora floor for short wordless lines
 _SUSTAIN_MULT_SOFT_HIGH = 0.90   # SOFT + line_ratio > 2.5 → stronger compression
 
+# ── Onset correction ───────────────────────────────────────────────────────────
+# Separates acoustic_start (VAD boundary) from vocal_onset (first voiced content)
+# so anti-stall budget and display start are anchored to actual singing, not to
+# the segment boundary that may include breath, sparse piano, or pre-vocal silence.
+_ONSET_MIN_SHIFT_S = 0.05   # ignore shifts smaller than this (noise floor)
+_ONSET_MAX_SHIFT_S = 3.0    # safety: never push startTime forward more than this
+_ONSET_PRELOAD_S   = 0.10   # UX lead — line is visible just before first word
+
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -440,6 +448,47 @@ def visual_timing_normalization(lines: list[dict], job_log=None) -> list[dict]:
         overlap_ceiling = next_acoustic_start + _VOCAL_OVERLAP_S
         _line_words     = line.get('words') or []
 
+        # ── Phase 0: vocal onset estimation ───────────────────────────────────
+        # Determines how far startTime should be pushed forward from acoustic_start
+        # to align with the first voiced content rather than the VAD boundary.
+        #
+        # Source priority:
+        #   1. _vad_anchor_ms (saved by aligner) — offset between Whisper VAD
+        #      segment start and the first CTC word timestamp.  This is the most
+        #      reliable signal: it directly measures pre-vocal silence + CTC lag
+        #      for segments where _apply_vad_anchor was applied.
+        #   2. first_word.start — only non-trivial when VAD anchor was *skipped*
+        #      (offset ≥ _MAX_CTC_LAG_S) and word timestamps retain their original
+        #      CTC positions, which happen to be close to the actual vocal onset.
+        #   3. acoustic_start — fallback when neither signal provides useful info.
+        _vad_anchor_ms = float(line.get('_vad_anchor_ms', 0.0))
+        _onset_source  = 'acoustic'
+        _vocal_onset   = a_start
+        _fw_start_log: float | None = None
+
+        if _vad_anchor_ms >= _ONSET_MIN_SHIFT_S * 1000:
+            _candidate = a_start + _vad_anchor_ms / 1000.0
+            if _ONSET_MIN_SHIFT_S <= (_candidate - a_start) <= _ONSET_MAX_SHIFT_S:
+                _vocal_onset  = _candidate
+                _onset_source = 'vad_anchor'
+
+        if _onset_source == 'acoustic' and _line_words:
+            for _w in _line_words:
+                _ws = _w.get('start')
+                if _ws is not None:
+                    _fw_start_log = float(_ws)
+                    _shift = _fw_start_log - a_start
+                    if _ONSET_MIN_SHIFT_S <= _shift <= _ONSET_MAX_SHIFT_S:
+                        _vocal_onset  = _fw_start_log
+                        _onset_source = 'first_word'
+                    break
+
+        # Preload: line activates _ONSET_PRELOAD_S before vocal onset so the UI
+        # has time to scroll and the viewer sees the line just before singing.
+        # Never before acoustic_start (no audio signal exists before that point).
+        _display_start  = max(a_start, _vocal_onset - _ONSET_PRELOAD_S)
+        _onset_shift_ms = round((_vocal_onset - a_start) * 1000.0, 1)
+
         # DTW-tail relaxation: when a CONT line's acousticEnd extends significantly
         # past the last WhisperX word, allow segment_end to reach into the DTW tail.
         # Word candidates (last_word, second_last_word) always use overlap_ceiling.
@@ -697,9 +746,33 @@ def visual_timing_normalization(lines: list[dict], job_log=None) -> list[dict]:
         if sustain_heavy:
             n_sustain += 1
 
-        # Overwrite canonical times with display-optimised values
-        line['startTime'] = round(a_start,    3)  # startTime is never changed
-        line['endTime']   = round(display_end, 3)
+        # Safety: display_start must leave at least _VIS_MIN_S of visible content.
+        # If the onset shift is so large that it exceeds the display window (rare,
+        # only for very short lines with a large pre-vocal silence), cap it.
+        _display_start = min(_display_start, max(a_start, display_end - _VIS_MIN_S))
+
+        # Onset instrumentation: log every line where a correction was applied.
+        if job_log and _onset_shift_ms > 0:
+            _fw_log = f"{_fw_start_log:.3f}s" if _fw_start_log is not None else "none"
+            job_log.info(
+                f"[onset_fix] L{i:02d}: "
+                f"acoustic={a_start:.3f}s "
+                f"first_word={_fw_log} "
+                f"vocal_onset={_vocal_onset:.3f}s "
+                f"display_start={_display_start:.3f}s "
+                f"shift_ms={_onset_shift_ms:.0f} "
+                f"has_words={bool(_line_words)} "
+                f"source={_onset_source}",
+                stage="align",
+            )
+
+        # Overwrite canonical times with display-optimised values.
+        # startTime now reflects vocalOnset (not acoustic_start) so the frontend
+        # anti-stall budget begins when singing starts, not at the VAD boundary.
+        # acousticStart preserves the raw segment boundary for gap-detection logic.
+        line['vocalOnset'] = round(_vocal_onset, 3)
+        line['startTime']  = round(_display_start, 3)
+        line['endTime']    = round(display_end, 3)
 
         # ── Continuity propagation (within-phrase only) ────────────────────
         # STRONG/SOFT boundaries never satisfy is_contiguous, so cross-phrase
@@ -799,6 +872,24 @@ def visual_timing_normalization(lines: list[dict], job_log=None) -> list[dict]:
                 f"→ reduction_scale={_reduction_scale:.3f} adjusted={_n_drift} lines",
                 stage="align",
             )
+
+    # ── Onset correction summary ──────────────────────────────────────────────────
+    _onset_shifts = [
+        round((float(l.get('vocalOnset', l.get('acousticStart', l['startTime'])))
+               - float(l.get('acousticStart', l['startTime']))) * 1000)
+        for l in lines
+    ]
+    _n_onset_corrected = sum(1 for s in _onset_shifts if s > 0)
+    _avg_onset_shift   = sum(_onset_shifts) / len(_onset_shifts) if _onset_shifts else 0.0
+    if job_log:
+        job_log.info(
+            f"[onset_fix] summary: corrected={_n_onset_corrected}/{n} "
+            f"avg_shift={_avg_onset_shift:.0f}ms "
+            f"gt500ms={sum(1 for s in _onset_shifts if s > 500)} "
+            f"gt1s={sum(1 for s in _onset_shifts if s > 1000)} "
+            f"gt2s={sum(1 for s in _onset_shifts if s > 2000)}",
+            stage="align",
+        )
 
     if job_log:
         n_phrases = 1 + sum(1 for b in _gap_types if b in ('SOFT', 'STRONG'))

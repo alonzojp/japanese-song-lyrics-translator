@@ -1619,6 +1619,14 @@ def _align_whisperx_with_official_lyrics(
 
             _segment_quality(candidates, source, i, job_log)
 
+            # Tag the first line of this segment with the VAD anchor offset.
+            # visual_timing_normalization uses this to estimate vocal onset:
+            # offset = (CTC first word) − (segment VAD start) = pre-vocal
+            # silence + CTC model latency.  Only present for word/char-anchored
+            # segments where _apply_vad_anchor was applied.
+            if _anchor_ms > 0 and candidates:
+                candidates[0]['_vad_anchor_ms'] = round(_anchor_ms, 1)
+
             for c in candidates:
                 c['_timing_source'] = source
             final.extend(candidates)
@@ -1664,6 +1672,8 @@ def _align_whisperx_with_official_lyrics(
                         stage="transcribe",
                     )
 
+            if _anchor_ms > 0 and silence_lines:
+                silence_lines[0]['_vad_anchor_ms'] = round(_anchor_ms, 1)
             final.extend(silence_lines)
             timing_sources[sil_src] += len(silence_lines)
             # Debug: record fallback lines

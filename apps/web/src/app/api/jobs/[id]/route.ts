@@ -43,6 +43,8 @@ export async function GET(_req: Request, { params }: RouteParams) {
             text: string;
             startTime: number;
             endTime: number;
+            acousticStart?: number;
+            acousticEnd?: number;
             words?: WordTiming[];
             confidence?: number;
           }> | undefined;
@@ -59,12 +61,14 @@ export async function GET(_req: Request, { params }: RouteParams) {
           await prisma.lyricLine.deleteMany({ where: { songId: song.id } });
           await prisma.lyricLine.createMany({
             data: lines.map((line, i) => ({
-              songId:    song.id,
-              lineIndex: i,
-              startTime: line.startTime,
-              endTime:   line.endTime,
-              japanese:  line.text,
-              words:     line.words ? JSON.stringify(line.words) : null,
+              songId:       song.id,
+              lineIndex:    i,
+              startTime:    line.startTime,
+              endTime:      line.endTime,
+              acousticStart: (line as { acousticStart?: number }).acousticStart ?? null,
+              acousticEnd:   (line as { acousticEnd?: number }).acousticEnd   ?? null,
+              japanese:     line.text,
+              words:        line.words ? JSON.stringify(line.words) : null,
             })),
           });
         }

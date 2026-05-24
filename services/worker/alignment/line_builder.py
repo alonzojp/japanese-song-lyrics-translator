@@ -67,6 +67,11 @@ def build_lyric_lines(
         if conf is not None:
             entry["confidence"] = round(conf, 3)
 
+        # Thread the VAD anchor offset through to visual_timing_normalization
+        # so vocal onset can be recovered without separate RMS audio analysis.
+        if seg.get('_vad_anchor_ms') is not None:
+            entry['_vad_anchor_ms'] = seg['_vad_anchor_ms']
+
         result.append(entry)
 
     return result

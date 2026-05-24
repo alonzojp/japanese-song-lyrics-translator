@@ -35,13 +35,15 @@ export async function GET(_req: Request, { params }: RouteParams) {
   }
 
   const lyricLines: LyricLine[] = lines.map((line) => ({
-    id:         `line-${line.lineIndex}`,
-    text:       line.japanese,
-    startTime:  line.startTime ?? 0,
-    endTime:    line.endTime   ?? 0,
-    words:      line.words    ? (JSON.parse(line.words)    as WordTiming[]) : undefined,
-    tokens:     line.tokens   ? (JSON.parse(line.tokens)   as Token[])     : undefined,
-    furigana:   line.analysis ? (JSON.parse(line.analysis) as { furigana?: string }).furigana : undefined,
+    id:           `line-${line.lineIndex}`,
+    text:         line.japanese,
+    startTime:    line.startTime ?? 0,
+    endTime:      line.endTime   ?? 0,
+    acousticStart: line.acousticStart ?? undefined,
+    acousticEnd:   line.acousticEnd   ?? undefined,
+    words:        line.words    ? (JSON.parse(line.words)    as WordTiming[]) : undefined,
+    tokens:       line.tokens   ? (JSON.parse(line.tokens)   as Token[])     : undefined,
+    furigana:     line.analysis ? (JSON.parse(line.analysis) as { furigana?: string }).furigana : undefined,
   }));
 
   return NextResponse.json({ lines: lyricLines, alignmentMeta });
@@ -65,12 +67,14 @@ export async function POST(req: Request, { params }: RouteParams) {
     await prisma.lyricLine.deleteMany({ where: { songId: params.id } });
     await prisma.lyricLine.createMany({
       data: lines.map((line, i) => ({
-        songId:    params.id,
-        lineIndex: i,
-        startTime: line.startTime,
-        endTime:   line.endTime,
-        japanese:  line.text,
-        words:     line.words ? JSON.stringify(line.words) : null,
+        songId:       params.id,
+        lineIndex:    i,
+        startTime:    line.startTime,
+        endTime:      line.endTime,
+        acousticStart: (line as { acousticStart?: number }).acousticStart ?? null,
+        acousticEnd:   (line as { acousticEnd?: number }).acousticEnd   ?? null,
+        japanese:     line.text,
+        words:        line.words ? JSON.stringify(line.words) : null,
       })),
     });
   }

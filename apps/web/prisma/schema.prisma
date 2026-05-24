@@ -27,10 +27,12 @@ model LyricLine {
   id        String   @id @default(cuid())
   songId    String
   song      Song     @relation(fields: [songId], references: [id], onDelete: Cascade)
-  lineIndex Int
-  startTime Float?
-  endTime   Float?
-  japanese  String
+  lineIndex    Int
+  startTime    Float?
+  endTime      Float?
+  acousticStart Float?
+  acousticEnd   Float?
+  japanese     String
   words     String?  // JSON: LyricWord[]  (word-level timestamps from WhisperX)
   tokens    String?  // JSON: Token[]      (morphological analysis)
   analysis  String?  // JSON: AnalysisResult (AI translation/breakdown)
