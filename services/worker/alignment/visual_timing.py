@@ -483,6 +483,51 @@ def visual_timing_normalization(lines: list[dict], job_log=None) -> list[dict]:
                         _onset_source = 'first_word'
                     break
 
+        # Phase 0 third fallback: collapsed-first-word detection.
+        # Fires when both vad_anchor and first_word.start gave zero shift,
+        # but the first word's duration is anomalously long relative to subsequent
+        # words — indicating CTC absorbed pre-vocal silence into the first word span.
+        if _onset_source == 'acoustic' and len(_line_words) >= 3:
+            _cfw_fw      = _line_words[0]
+            _cfw_fw_start = _cfw_fw.get('start')
+            _cfw_fw_end   = _cfw_fw.get('end')
+            if _cfw_fw_start is not None and _cfw_fw_end is not None:
+                _cfw_fw_dur = float(_cfw_fw_end) - float(_cfw_fw_start)
+                _cfw_next_slice = _line_words[1:5]
+                _cfw_next_durs = [
+                    float(w['end']) - float(w['start'])
+                    for w in _cfw_next_slice
+                    if w.get('start') is not None and w.get('end') is not None
+                ]
+                if _cfw_next_durs:
+                    _cfw_nd_sorted   = sorted(_cfw_next_durs)
+                    _cfw_median_next = _cfw_nd_sorted[len(_cfw_nd_sorted) // 2]
+                    _cfw_ratio       = _cfw_fw_dur / _cfw_median_next if _cfw_median_next > 0 else 0.0
+
+                    if (_cfw_median_next >= 0.12        # not fast rap
+                            and _cfw_fw_dur > 1.2       # first word is long
+                            and _cfw_ratio > 3.0):      # and anomalously longer than peers
+
+                        _cfw_fw_end_f  = float(_cfw_fw_end)
+                        _cfw_est_onset = _cfw_fw_end_f - min(_cfw_median_next * 1.2, _cfw_fw_dur * 0.45)
+                        _cfw_est_onset = min(_cfw_est_onset, _cfw_fw_end_f - 0.12)  # safety floor
+                        _cfw_shift     = _cfw_est_onset - a_start
+                        if _ONSET_MIN_SHIFT_S <= _cfw_shift <= 2.5:
+                            _vocal_onset  = _cfw_est_onset
+                            _onset_source = 'collapsed_first_word'
+                            if job_log:
+                                job_log.info(
+                                    f"[collapsed_onset] L{i:02d}: "
+                                    f"acoustic_start={a_start:.3f}s "
+                                    f"first_word={_cfw_fw.get('word', '?')!r} "
+                                    f"first_word_duration={_cfw_fw_dur:.3f}s "
+                                    f"median_next_duration={_cfw_median_next:.3f}s "
+                                    f"ratio={_cfw_ratio:.2f} "
+                                    f"inferred_onset={_vocal_onset:.3f}s "
+                                    f"shift_ms={round(_cfw_shift * 1000):.0f}",
+                                    stage="align",
+                                )
+
         # Preload: line activates _ONSET_PRELOAD_S before vocal onset so the UI
         # has time to scroll and the viewer sees the line just before singing.
         # Never before acoustic_start (no audio signal exists before that point).
