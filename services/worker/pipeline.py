@@ -30,8 +30,10 @@ from models import JobStatus
 from job_queue import get_job, set_job_status, update_job_step, update_step_message
 import asyncio
 
-from alignment.matcher   import run_offline_match
-from alignment.selector  import select_best_alignment
+from alignment.matcher       import run_offline_match
+from alignment.selector      import select_best_alignment
+from alignment.visual_timing import visual_timing_normalization, finalize_timeline, classify_gap, _INST_GAP_THRESH_S, _VOCAL_GAP_THRESH_S
+from alignment.outputs       import save_canonical_lines, load_canonical_lines
 from correction import correct_segments
 from lyrics.fetcher import fetch_lyrics, get_cached as get_cached_lyrics
 from lyrics.types import VideoInfo
@@ -60,6 +62,150 @@ def _msg_cb(job_id: str, step: str):
     def cb(message: str) -> None:
         update_step_message(job_id, step, message)
     return cb
+
+
+def _timeline_grade(lines: list[dict]) -> tuple[int, str]:
+    """
+    Score the canonical timeline using misalignment artifact signals only.
+
+    The phrase model classifies every inter-line gap:
+      CONT   ≤ 1.5s  within-phrase; tight flow expected here.
+      SOFT   1.5–4s  verse/chorus transition; structural, not an error.
+      STRONG > 4s    instrumental break; structural, not an error.
+
+    Only CONT-gap quality and display-duration artifacts are penalised.
+    SOFT and STRONG boundaries carry zero penalty regardless of count or size —
+    penalising them would treat correct musical structure as noise.
+
+    Penalty signals (all are misalignment artifacts, not musical choices):
+      short_lines  < 1.5s  over-compression left a line too brief to read     −8 each
+      overlaps     < 0     finalize_timeline invariant violated                −20 each
+      large_cont   > 0.5s  within-phrase dead air visible to the viewer        −3 each
+      avg_cont excess      broad within-phrase flow degradation                 −10/s
+    """
+    n = len(lines)
+    if n == 0:
+        return 0, 'F'
+
+    gaps = []
+    durs = []
+    for i, ln in enumerate(lines):
+        start = ln.get('startTime', 0)
+        end   = ln.get('endTime',   0)
+        durs.append(max(0.0, end - start))
+        if i + 1 < n:
+            gap = lines[i + 1].get('startTime', end) - end
+            gaps.append(gap)
+
+    # ── Misalignment artifact signals ─────────────────────────────────────────
+    short_lines = sum(1 for d in durs if d < 1.5)
+    overlaps    = sum(1 for g in gaps if g < -0.01)
+
+    # CONT gaps only: SOFT and STRONG excluded (they are structural, not artifacts)
+    cont_gaps  = [g for g in gaps if classify_gap(g) == 'CONT']
+    large_cont = [g for g in cont_gaps if g > 0.5]   # visible dead air within a phrase
+    avg_cont   = sum(cont_gaps) / len(cont_gaps) if cont_gaps else 0.0
+
+    score = 100
+    score -= short_lines     * 8    # unreadable line — over-compression artifact
+    score -= overlaps        * 20   # timeline integrity failure
+    score -= len(large_cont) * 3    # within-phrase dead air (>0.5s gap)
+    score -= max(0.0, avg_cont - 0.3) * 10  # excess avg within-phrase gap
+    score  = max(0, min(100, int(score)))
+
+    grade = (
+        'A' if score >= 90 else
+        'B' if score >= 75 else
+        'C' if score >= 55 else
+        'D' if score >= 35 else 'F'
+    )
+    return score, grade
+
+
+def _write_canonical(job_cache: Path, jl) -> None:
+    """
+    Select the best alignment, normalize if needed, write canonical_lines.json.
+
+    Called exactly once per job, at pipeline completion.
+    After this point the result API reads canonical_lines.json directly —
+    no re-selection, no scoring, no mutation happens during GET requests.
+
+    Acoustic lines are already normalized by run_alignment_postprocess().
+    DTW lines bypass that step and are normalized here so both paths produce
+    identical output structure (mora-compressed, gap-aware, finalized).
+    """
+    selection = select_best_alignment(job_cache, job_log=jl)
+    lines  = selection["lines"]
+    source = selection["source"]   # "acoustic" | "dtw"
+    meta   = selection["selection_meta"]
+
+    if not lines:
+        jl.warning("[canonical] Selection returned no lines — canonical_lines.json not written")
+        return
+
+    jl.info(
+        f"[canonical] source={source} "
+        f"acoustic={selection['acoustic_score']:.3f} "
+        f"dtw={selection['dtw_score']:.3f}: {meta.get('reason', '')}",
+        stage="align",
+    )
+
+    # DTW lines have not passed through visual_timing_normalization / finalize_timeline.
+    # Acoustic lines are already normalized — running them through again would
+    # double-compress them, so we only normalize on the DTW path.
+    if source == "dtw":
+        visual_timing_normalization(lines, job_log=jl)
+        finalize_timeline(lines, job_log=jl)
+        jl.info(
+            f"[canonical] DTW lines normalized through display pipeline ({len(lines)} lines)",
+            stage="align",
+        )
+
+    save_canonical_lines(job_cache, lines, source, meta)
+    jl.info(f"[canonical] Wrote {len(lines)} lines → canonical_lines.json", stage="align")
+    for i, ln in enumerate(lines):
+        start = ln.get("startTime", 0)
+        end   = ln.get("endTime", 0)
+        dur   = round(end - start, 3)
+        gap_str = ""
+        if i + 1 < len(lines):
+            gap = round(lines[i + 1].get("startTime", end) - end, 3)
+            if gap < -0.01:
+                boundary_tag = " ⚑OVERLAP"
+            elif gap == 0.0:
+                boundary_tag = " [CONT]"
+            else:
+                btype = classify_gap(gap)
+                boundary_tag = "" if btype == 'CONT' else f" [{btype} {gap:.2f}s]"
+            gap_str = f" gap={gap:.3f}s{boundary_tag}"
+        jl.info(
+            f"[canonical] L{i:02d}: {start:.3f}–{end:.3f}s "
+            f"({dur:.3f}s){gap_str} '{ln.get('text', '')[:40]}'",
+            stage="align",
+        )
+
+    # ── Timeline summary + quality grade ────────────────────────────────────
+    score, grade = _timeline_grade(lines)
+    n = len(lines)
+    _gaps  = [lines[i+1].get("startTime", 0) - lines[i].get("endTime", 0) for i in range(n-1)]
+    _durs  = [ln.get("endTime", 0) - ln.get("startTime", 0) for ln in lines]
+    _avg_g = round(sum(_gaps) / len(_gaps), 3) if _gaps else 0.0
+    _max_g = round(max(_gaps), 3) if _gaps else 0.0
+    _med_d = round(sorted(_durs)[n // 2], 3) if _durs else 0.0
+    _short = sum(1 for d in _durs if d < 1.5)
+    _long  = sum(1 for d in _durs if d > 8.0)
+    _n_strong = sum(1 for g in _gaps if classify_gap(g) == 'STRONG')
+    _n_soft   = sum(1 for g in _gaps if classify_gap(g) == 'SOFT')
+    _n_cont   = sum(1 for g in _gaps if classify_gap(g) == 'CONT')
+    _n_phrases = 1 + _n_strong + _n_soft
+    jl.info(
+        f"[timeline_summary] total_lines={n} phrases={_n_phrases} "
+        f"boundaries: {_n_cont}xCONT {_n_soft}xSOFT {_n_strong}xSTRONG | "
+        f"avg_gap={_avg_g}s max_gap={_max_g}s median_dur={_med_d}s "
+        f"short_lines={_short} long_lines={_long} "
+        f"selector={source} grade={grade}({score})",
+        stage="align",
+    )
 
 
 def run_job(job_id: str) -> None:
@@ -93,6 +239,13 @@ def run_job(job_id: str) -> None:
         if get_cached_lyrics(yt_id):
             jl.info("All stages cached — instant completion")
             _mark_all_complete(job_id)
+            # For jobs cached before canonical_lines.json existed, generate it now.
+            # This is a pure read + normalize — no ML, sub-second, non-fatal.
+            if not load_canonical_lines(job_cache):
+                try:
+                    _write_canonical(job_cache, jl)
+                except Exception as exc:
+                    jl.warning(f"Canonical write on cache-hit failed (non-fatal): {exc}")
             set_job_status(job_id, JobStatus.completed,
                            result_path=str(job_cache / "lyrics.json"))
             return
@@ -125,8 +278,9 @@ def run_job(job_id: str) -> None:
                     f"Offline match: {len(match_result['lines'])} lines, "
                     f"avg_conf={match_result['stats'].get('avgConfidence', 0):.2f}",
                 )
+            _write_canonical(job_cache, jl)
         except Exception as lyr_exc:
-            jl.warning(f"Lyrics fetch failed (non-fatal): {lyr_exc}")
+            jl.warning(f"Lyrics fetch/canonical failed (non-fatal): {lyr_exc}")
         set_job_status(job_id, JobStatus.completed,
                        result_path=str(job_cache / "lyrics.json"))
         return
@@ -274,11 +428,10 @@ def run_job(job_id: str) -> None:
             except Exception as lyr_exc:
                 jl.warning(f"Auto lyrics fetch failed (non-fatal): {lyr_exc}")
 
-        # ── Optional step 5: offline DTW match against official lyrics ─────────
+        # ── Optional step 5: offline DTW match + write canonical output ──────────
         # Runs only if lyrics_cached.json exists (from the lyrics provider system).
-        # After matching, the selector compares DTW vs acoustic quality and logs why
-        # a specific alignment was chosen. The selection is re-evaluated on every
-        # result read, but logging it here gives a record during processing.
+        # Selection happens once here; canonical_lines.json is the permanent result.
+        # GET /jobs/{id}/result reads canonical_lines.json — no re-selection on reads.
         try:
             match_result = run_offline_match(job_cache, yt_id, job_log=jl)
             if match_result:
@@ -287,14 +440,9 @@ def run_job(job_id: str) -> None:
                     f"avg_conf={match_result['stats'].get('avgConfidence', 0):.2f}, "
                     f"avg_sim={match_result['stats'].get('avgSimilarity', 0):.2f}",
                 )
-            selection = select_best_alignment(job_cache, job_log=jl)
-            jl.info(
-                f"Alignment selected: source={selection['selection_meta']['selectedSource']}, "
-                f"acoustic_score={selection['acoustic_score']:.3f}, "
-                f"dtw_score={selection['dtw_score']:.3f}"
-            )
+            _write_canonical(job_cache, jl)
         except Exception as match_exc:
-            jl.warning(f"Offline match/selection skipped: {match_exc}")
+            jl.warning(f"Offline match/canonical skipped: {match_exc}")
 
         result_path = str(job_cache / "lyrics.json")
         set_job_status(job_id, JobStatus.completed, result_path=result_path)

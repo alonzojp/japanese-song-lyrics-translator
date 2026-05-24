@@ -18,7 +18,6 @@ from pydantic import BaseModel, Field
 from typing import Optional
 
 from alignment.matcher   import match_lyric_lines, run_offline_match
-from alignment.selector  import select_best_alignment
 from cache import cache_dir, cleanup_old, list_cached
 from config import CACHE_MAX_AGE_DAYS, WHISPER_MODEL, WORKER_CONCURRENCY
 from logs import get_recent_logs, get_best_logs
@@ -105,6 +104,90 @@ async def evict_cache(youtube_id: str) -> dict:
     return {"evicted": youtube_id}
 
 
+@app.delete("/cache/{youtube_id}/alignment")
+async def invalidate_alignment(youtube_id: str) -> dict:
+    """
+    Invalidate only the transcribe + align stages, preserving audio and vocals.
+    Use this when you want WhisperX to re-run (e.g. official lyrics changed).
+    """
+    from config import CACHE_DIR
+    target = CACHE_DIR / youtube_id
+    if not target.exists():
+        raise HTTPException(status_code=404, detail="Not in cache")
+
+    from cache import invalidate_stage
+    invalidate_stage(youtube_id, "transcribe")
+    invalidate_stage(youtube_id, "align")
+
+    _files = [
+        "transcript.json",
+        "aligned_words.json",
+        "aligned_lines.json",
+        "alignment_meta.json",
+        "alignment_selection.json",
+        "canonical_lines.json",
+        "matched_lyrics.json",
+        "alignment_diagnostic.txt",
+        "alignment_debug.json",
+        "lyrics.json",
+    ]
+    removed = []
+    for name in _files:
+        p = target / name
+        if p.exists():
+            p.unlink()
+            removed.append(name)
+
+    return {
+        "youtubeId":         youtube_id,
+        "invalidatedStages": ["transcribe", "align"],
+        "removedFiles":      removed,
+    }
+
+
+@app.delete("/cache/{youtube_id}/postprocess")
+async def invalidate_postprocess(youtube_id: str) -> dict:
+    """
+    Invalidate only the align (post-processing) stage.
+
+    Keeps download, separate, transcribe, and aligned_words.json intact so the
+    pipeline skips straight to the Python algorithm layer on the next reprocess.
+    Use this when testing changes to timing/alignment algorithms.
+    """
+    from config import CACHE_DIR
+    target = CACHE_DIR / youtube_id
+    if not target.exists():
+        raise HTTPException(status_code=404, detail="Not in cache")
+
+    from cache import invalidate_stage
+    invalidate_stage(youtube_id, "align")
+
+    # Only delete files produced by the Python post-processing layer.
+    # aligned_words.json (WhisperX output) is intentionally kept.
+    _files = [
+        "aligned_lines.json",
+        "alignment_meta.json",
+        "alignment_selection.json",
+        "canonical_lines.json",
+        "matched_lyrics.json",
+        "alignment_diagnostic.txt",
+        "alignment_debug.json",
+        "lyrics.json",
+    ]
+    removed = []
+    for name in _files:
+        p = target / name
+        if p.exists():
+            p.unlink()
+            removed.append(name)
+
+    return {
+        "youtubeId":         youtube_id,
+        "invalidatedStages": ["align"],
+        "removedFiles":      removed,
+    }
+
+
 # ── Jobs ───────────────────────────────────────────────────────────────────────
 
 @app.post("/jobs", status_code=201)
@@ -134,10 +217,15 @@ async def get_job_endpoint(job_id: str) -> dict:
     job = get_job(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
-    # Return full log history for completed jobs so the frontend can persist them.
-    # For in-progress jobs 40 is enough for the live panel without bloating polls.
-    log_limit = 5000 if job.status == JobStatus.completed else 40
-    logs = get_recent_logs(job_id, limit=log_limit)
+    # For completed jobs use get_best_logs (richest historical set for the
+    # video — includes transcription logs from prior full runs even when the
+    # current job was postprocess-only). For in-progress/failed jobs use
+    # get_recent_logs so live streaming reflects the current job.
+    log_limit = 5000
+    if job.status == JobStatus.completed and job.youtube_id:
+        logs = get_best_logs(job.youtube_id, limit=log_limit)
+    else:
+        logs = get_recent_logs(job_id, limit=log_limit)
     return job.to_api(logs=logs)
 
 
@@ -161,11 +249,23 @@ async def get_result_endpoint(job_id: str) -> dict:
 
     result_dir = Path(result_path).parent
 
-    # Select the best available alignment — quality-gated, never blindly prefer DTW
-    selection = select_best_alignment(result_dir)
-    data["alignedLines"]      = selection["lines"]
-    data["matchedStats"]      = selection["stats"]
-    data["alignmentSelection"] = selection["selection_meta"]
+    # Read the canonical alignment written once at job completion.
+    # No selector execution, no scoring, no mutation at request time.
+    canonical_path = result_dir / "canonical_lines.json"
+    if canonical_path.exists():
+        canonical = json.loads(canonical_path.read_text(encoding="utf-8"))
+        data["alignedLines"]       = canonical.get("lines", [])
+        data["alignmentSelection"] = canonical.get("selectionMeta", {})
+        data["matchedStats"]       = {}
+    else:
+        # Backward compat: job predates canonical_lines.json.
+        # Serve acoustic lines directly — already normalized, no mutation needed.
+        aligned_path = result_dir / "aligned_lines.json"
+        if aligned_path.exists():
+            aligned = json.loads(aligned_path.read_text(encoding="utf-8"))
+            data["alignedLines"] = aligned.get("lines", [])
+        data["alignmentSelection"] = {}
+        data["matchedStats"]       = {}
 
     meta_path = result_dir / "alignment_meta.json"
     if meta_path.exists():

@@ -15,11 +15,14 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-TRANSCRIPT_FILE     = "transcript.json"
-ALIGNED_WORDS_FILE  = "aligned_words.json"
-ALIGNED_LINES_FILE  = "aligned_lines.json"
-ALIGNMENT_META_FILE = "alignment_meta.json"
-LYRICS_FILE         = "lyrics.json"
+TRANSCRIPT_FILE      = "transcript.json"
+ALIGNED_WORDS_FILE   = "aligned_words.json"
+ALIGNED_LINES_FILE   = "aligned_lines.json"
+ALIGNMENT_META_FILE  = "alignment_meta.json"
+LYRICS_FILE          = "lyrics.json"
+# Written once at job completion by _write_canonical() in pipeline.py.
+# The result API reads this file directly — never re-derived at request time.
+CANONICAL_LINES_FILE = "canonical_lines.json"
 
 # Bump this string whenever alignment logic changes so stale aligned_words.json
 # files are automatically rejected and force_align() re-runs.
@@ -72,6 +75,37 @@ def save_aligned_lines(output_dir: Path, lines: list[dict]) -> Path:
                 "metadata":  {"savedAt": _now()},
             },
             ensure_ascii=False, indent=2,
+        ),
+        encoding="utf-8",
+    )
+    return path
+
+
+def save_canonical_lines(
+    output_dir:     Path,
+    lines:          list[dict],
+    source:         str,   # "acoustic" | "dtw"
+    selection_meta: dict,
+) -> Path:
+    """
+    Write the final display-normalized canonical lines.
+
+    Called exactly once per job (by _write_canonical in pipeline.py).
+    After this file exists, the result API reads it directly — no scoring,
+    no selector execution, no mutation happens at request time.
+    """
+    path = output_dir / CANONICAL_LINES_FILE
+    path.write_text(
+        json.dumps(
+            {
+                "lineCount":     len(lines),
+                "source":        source,
+                "selectionMeta": selection_meta,
+                "savedAt":       _now(),
+                "lines":         lines,
+            },
+            ensure_ascii=False,
+            indent=2,
         ),
         encoding="utf-8",
     )
@@ -145,6 +179,15 @@ def load_alignment_meta(output_dir: Path) -> Optional[dict]:
     if not path.exists():
         return None
     return json.loads(path.read_text(encoding="utf-8"))
+
+
+def load_canonical_lines(output_dir: Path) -> Optional[list[dict]]:
+    """Return lines from canonical_lines.json, or None if not yet written."""
+    path = output_dir / CANONICAL_LINES_FILE
+    if not path.exists():
+        return None
+    data = json.loads(path.read_text(encoding="utf-8"))
+    return data.get("lines")
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────

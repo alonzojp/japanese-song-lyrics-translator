@@ -103,6 +103,13 @@ def run_transcription(
 
         raw_segments, backend = transcribe(asr_path, progress_cb=tx_cb, message_cb=message_cb, job_log=job_log)
         log(f"Transcription complete: {len(raw_segments)} segments via {backend}")
+        if job_log:
+            for i, seg in enumerate(raw_segments):
+                job_log.info(
+                    f"[whisper_seg] S{i:02d}: {seg.get('start', 0):.2f}–{seg.get('end', 0):.2f}s "
+                    f"words={len(seg.get('words', []))}  '{seg.get('text', '').strip()[:60]}'",
+                    stage="transcribe",
+                )
         save_transcript(output_dir, raw_segments, backend)
 
     # ── 3c: Forced alignment (70–100 %) ────────────────────────────────────────
@@ -139,6 +146,22 @@ def run_transcription(
             progress_cb=al_cb, job_log=job_log,
         )
         log(f"Alignment complete via {method}: {len(aligned_segs)} segments")
+        if job_log:
+            total_words = sum(len(s.get('words', [])) for s in aligned_segs)
+            words_with_ts = sum(
+                1 for s in aligned_segs for w in s.get('words', [])
+                if w.get('start') is not None and w.get('end') is not None
+            )
+            all_words = [w for s in aligned_segs for w in s.get('words', [])
+                         if w.get('start') is not None]
+            t_start = min((w['start'] for w in all_words), default=0)
+            t_end   = max((w['end']   for w in all_words if w.get('end') is not None), default=0)
+            job_log.info(
+                f"[aligned_words] {total_words} words total, "
+                f"{words_with_ts}/{total_words} have timestamps, "
+                f"span={t_start:.2f}–{t_end:.2f}s",
+                stage="transcribe",
+            )
         saved = save_aligned_words(output_dir, aligned_segs, method)
         log(f"Wrote aligned_words.json → {saved}")
 

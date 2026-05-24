@@ -50,6 +50,7 @@ services:
       WHISPER_COMPUTE_TYPE:   ${WHISPER_COMPUTE_TYPE:-auto}
       WHISPER_BATCH_SIZE:     ${WHISPER_BATCH_SIZE:-16}
       SKIP_VOCAL_SEPARATION:  ${SKIP_VOCAL_SEPARATION:-false}
+      DEMUCS_MODEL:           ${DEMUCS_MODEL:-htdemucs_ft}
       CORS_ORIGINS:           http://localhost:3000,http://web:3000
     volumes:
       - cache_data:/cache

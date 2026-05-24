@@ -307,6 +307,121 @@ def _norm_chars(text: str) -> str:
     return s.lower()
 
 
+# ── Hybrid timing: bridge DTW char-level gaps ──────────────────────────────────
+
+_BRIDGE_THRESHOLD_S = 1.5   # bridge cross-segment gaps smaller than this
+
+
+def _build_word_timeline(transcript: list[dict]) -> list[tuple[float, float]]:
+    """Flat sorted list of (word_start, word_end) from all transcript words."""
+    times: list[tuple[float, float]] = []
+    for seg in transcript:
+        for w in seg.get('words', []):
+            s = w.get('start')
+            e = w.get('end')
+            if s is not None and e is not None:
+                times.append((float(s), float(e)))
+    times.sort()
+    return times
+
+
+def _has_speech_in_gap(
+    word_times: list[tuple[float, float]],
+    t_start: float,
+    t_end: float,
+) -> bool:
+    """Return True if any word overlaps the interval [t_start, t_end]."""
+    for ws, we in word_times:
+        if ws > t_end + 0.05:
+            break
+        if we >= t_start - 0.05:
+            return True
+    return False
+
+
+def _bridge_acoustic_gaps(
+    lines:      list[dict],
+    transcript: list[dict],
+    job_log=None,
+) -> list[dict]:
+    """
+    Eliminate artificial inter-line gaps produced by DTW char-level matching.
+
+    DTW assigns each official lyric line to a WhisperX *segment*, then
+    _apply_char_timestamps refines positions using bigram similarity within
+    the character stream.  When consecutive lines share the same segment the
+    char matcher can leave a gap that has no acoustic basis — the word stream
+    is contiguous and no silence exists there.
+
+    Bridging rules:
+      1. Same transcriptIndex  → always bridge (gap is a char-match artefact)
+      2. Adjacent segment indices, gap < _BRIDGE_THRESHOLD_S, no speech in gap
+                               → bridge (small cross-segment transition artefact)
+      3. All other cases       → preserve (intentional pause / instrumental)
+
+    The function mutates lines in-place and returns them.
+    """
+    if len(lines) < 2:
+        return lines
+
+    word_times = _build_word_timeline(transcript)
+
+    for i in range(len(lines) - 1):
+        curr    = lines[i]
+        nxt     = lines[i + 1]
+        curr_tx = curr.get('transcriptIndex', -1)
+        next_tx = nxt.get('transcriptIndex', -1)
+        gap     = round(nxt['startTime'] - curr['endTime'], 3)
+
+        if gap <= 0.05:
+            continue   # already contiguous (rounding noise)
+
+        bridged = False
+        speech_in_gap = False
+        timing_source = nxt.get('timingSource', 'dtw_char')
+
+        if curr_tx >= 0 and curr_tx == next_tx:
+            # ── Rule 1: same WhisperX segment ─────────────────────────────────
+            nxt['startTime'] = curr['endTime']
+            bridged = True
+            bridge_reason = f'same_segment(tx={curr_tx})'
+
+        elif (curr_tx >= 0 and next_tx == curr_tx + 1
+              and gap < _BRIDGE_THRESHOLD_S):
+            # ── Rule 2: adjacent segments, small gap ──────────────────────────
+            speech_in_gap = _has_speech_in_gap(
+                word_times, curr['endTime'], nxt['startTime']
+            )
+            if not speech_in_gap:
+                nxt['startTime'] = curr['endTime']
+                bridged = True
+                bridge_reason = (
+                    f'adjacent_segs_no_speech'
+                    f'(tx={curr_tx}→{next_tx} gap={gap:.3f}s)'
+                )
+            else:
+                bridge_reason = (
+                    f'preserved_speech_in_gap'
+                    f'(tx={curr_tx}→{next_tx} gap={gap:.3f}s)'
+                )
+        else:
+            bridge_reason = (
+                f'preserved_intentional'
+                f'(tx={curr_tx}→{next_tx} gap={gap:.3f}s)'
+            )
+
+        if job_log:
+            job_log.info(
+                f"[hybrid] L{i+1:02d}: "
+                f"text='{nxt.get('text', '')[:20]}' "
+                f"gap_was={gap:.3f}s bridged={bridged} "
+                f"speech_in_gap={speech_in_gap} "
+                f"reason={bridge_reason} "
+                f"new_start={nxt['startTime']:.3f}s",
+                stage='align',
+            )
+
+
 def _apply_char_timestamps(
     matched_lines: list[dict],
     word_segments: list[dict],
@@ -519,6 +634,12 @@ def match_lyric_lines(
     # Refine timestamps using character-level word alignment (more precise than
     # segment-level matching). Falls back to even subdivision if it fails.
     lines = _apply_char_timestamps(lines, transcript)
+
+    # Bridge artificial gaps introduced by char-level bigram matching.
+    # Must run BEFORE _subdivide_shared_segments so the subdivision step
+    # only sees residual unresolved cases (should be rare after bridging).
+    _bridge_acoustic_gaps(lines, transcript, job_log=job_log)
+
     _subdivide_shared_segments(lines)  # fallback for any remaining shared segments
 
     avg_conf = sum(l['confidence'] for l in lines) / max(1, len(lines))

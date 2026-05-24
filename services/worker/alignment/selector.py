@@ -124,6 +124,68 @@ def _repair_timestamps(lines: list[dict]) -> list[dict]:
 
 # ── Per-candidate scoring ──────────────────────────────────────────────────────
 
+# Gap thresholds for playback quality assessment
+_UNEXPLAINED_GAP_MIN_S = 0.75   # gaps > this (but < instrumental) are "unexplained"
+_INSTRUMENTAL_GAP_S    = 20.0   # gaps > this are assumed intentional (bridge/outro)
+_SHORT_LINE_S          = 1.5    # lines shorter than this hurt readability
+_LONG_LINE_S           = 8.0    # lines longer than this hurt readability
+
+
+def _score_playback(lines: list[dict], job_log=None) -> float:
+    """
+    Playback continuity and readability score [0.0–1.0].
+
+    Penalises:
+      - Repeated unexplained gaps (0.75s–20s) between lines
+      - Excessive short lines (< 1.5s)
+      - Excessive long lines (> 8s)
+
+    Does NOT penalise large intentional gaps (> 20s = instrumental/bridge).
+    """
+    n = len(lines)
+    if n < 2:
+        return 1.0
+
+    gaps  = []
+    durs  = []
+    for i, line in enumerate(lines):
+        start = line.get("startTime", 0.0)
+        end   = line.get("endTime",   0.0)
+        durs.append(max(0.0, end - start))
+        if i + 1 < n:
+            gap = lines[i + 1].get("startTime", end) - end
+            gaps.append(gap)
+
+    avg_gap = sum(gaps) / len(gaps) if gaps else 0.0
+    max_gap = max(gaps) if gaps else 0.0
+    unexplained = [g for g in gaps if _UNEXPLAINED_GAP_MIN_S < g < _INSTRUMENTAL_GAP_S]
+    short_lines = sum(1 for d in durs if d < _SHORT_LINE_S)
+    long_lines  = sum(1 for d in durs if d > _LONG_LINE_S)
+
+    # Continuous pairs (gap ≤ 0.5s)
+    contiguous_pairs = sum(1 for g in gaps if g <= 0.50)
+
+    # Penalties: each unexplained gap = 4%, each short = 2%, each long = 1.5%
+    gap_penalty   = min(0.60, len(unexplained) / n * 0.90)
+    short_penalty = min(0.20, short_lines / n * 0.40)
+    long_penalty  = min(0.15, long_lines  / n * 0.30)
+
+    score = max(0.0, 1.0 - gap_penalty - short_penalty - long_penalty)
+
+    if job_log:
+        job_log.info(
+            f"[playback_quality] "
+            f"avg_gap={avg_gap:.2f}s max_gap={max_gap:.1f}s "
+            f"unexplained_gaps={len(unexplained)}/{len(gaps)} "
+            f"short_lines={short_lines} long_lines={long_lines} "
+            f"contiguous_pairs={contiguous_pairs}/{len(gaps)} "
+            f"continuity={score:.3f}",
+            stage="align",
+        )
+
+    return round(score, 4)
+
+
 def _score_acoustic(method: str, confidence_dict: dict, lines: list[dict]) -> float:
     """
     Composite quality score for the acoustic alignment.
@@ -135,10 +197,18 @@ def _score_acoustic(method: str, confidence_dict: dict, lines: list[dict]) -> fl
     return round(trust * conf * ts_score, 4)
 
 
-def _score_dtw(stats: dict, lines: list[dict]) -> float:
+def _score_dtw(stats: dict, lines: list[dict], job_log=None) -> float:
     """
     Composite quality score for the DTW-matched alignment.
-    Weighted blend of similarity, confidence, anchor density, and flag rate.
+
+    Weights:
+      35% text similarity  (how well official lyrics matched the transcript)
+      30% confidence       (DTW composite per-line confidence)
+      10% anchor bonus     (high-confidence anchor density)
+      15% flag penalty     (low-confidence lines)
+      25% playback quality (gap continuity + readability — NEW)
+
+    Total raw ≤ 1.05 before ts_score and playback weighting.
     """
     n        = max(1, len(lines))
     avg_sim  = stats.get("avgSimilarity", 0.0)
@@ -146,11 +216,18 @@ def _score_dtw(stats: dict, lines: list[dict]) -> float:
     anchors  = stats.get("totalAnchors",  0)
     flagged  = len(stats.get("flaggedLines", []))
 
-    anchor_bonus = min(0.10, anchors / n * 0.20)
-    flag_penalty = flagged / n * 0.15
-    ts_score     = _ts_validity(_check_timestamps(lines), n)
+    anchor_bonus    = min(0.10, anchors / n * 0.20)
+    flag_penalty    = flagged / n * 0.15
+    ts_score        = _ts_validity(_check_timestamps(lines), n)
+    playback_score  = _score_playback(lines, job_log=job_log)
 
-    raw = 0.45 * avg_sim + 0.40 * avg_conf + anchor_bonus - flag_penalty
+    raw = (
+        0.35 * avg_sim
+        + 0.30 * avg_conf
+        + anchor_bonus
+        - flag_penalty
+        + 0.25 * playback_score
+    )
     return round(max(0.0, raw) * ts_score, 4)
 
 
@@ -234,7 +311,7 @@ def select_best_alignment(
         dtw_lines = dtw_data.get("lines", [])
         dtw_stats = dtw_data.get("stats", {})
 
-    dtw_score = _score_dtw(dtw_stats, dtw_lines) if dtw_lines else 0.0
+    dtw_score = _score_dtw(dtw_stats, dtw_lines, job_log=job_log) if dtw_lines else 0.0
 
     # ── Drift analysis (when both available) ────────────────────────────────
     drift_info = _detect_drift(acoustic_lines, dtw_lines)
@@ -335,17 +412,22 @@ def select_best_alignment(
 
     winning_lines = dtw_lines if selected == "dtw" else acoustic_lines
 
+    acoustic_playback = _score_playback(acoustic_lines) if acoustic_lines else 0.0
+    dtw_playback      = _score_playback(dtw_lines)      if dtw_lines      else 0.0
+
     selection_meta = {
         "selectedSource":        selected,
         "reason":                reason,
         "acousticMethod":        acoustic_method,
         "acousticScore":         acoustic_score,
         "acousticOverallConf":   acoustic_conf_dict.get("overall", 0.0),
+        "acousticPlayback":      acoustic_playback,
         "dtwScore":              dtw_score,
         "dtwSimilarity":         round(dtw_stats.get("avgSimilarity", 0.0), 4),
         "dtwConfidence":         round(dtw_stats.get("avgConfidence", 0.0), 4),
         "dtwAnchors":            dtw_stats.get("totalAnchors", 0),
         "dtwFlaggedCount":       len(dtw_stats.get("flaggedLines", [])),
+        "dtwPlayback":           dtw_playback,
         "drift":                 drift_info,
         "dtwTimestampIssues":    _check_timestamps(dtw_lines) if dtw_lines else {},
         "selectedAt":            datetime.now(timezone.utc).isoformat(),

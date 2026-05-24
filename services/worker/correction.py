@@ -100,10 +100,12 @@ def correct_segments(
 
         result = []
         changes = 0
-        for seg, new_text in zip(segments, corrected_lines):
+        for i, (seg, new_text) in enumerate(zip(segments, corrected_lines)):
             new_text = new_text.strip()
-            if new_text != seg.get("text", "").strip():
+            old_text = seg.get("text", "").strip()
+            if new_text != old_text:
                 changes += 1
+                log(f"[Groq] seg{i:02d} changed: '{old_text}' → '{new_text}'")
             result.append({**seg, "text": new_text})
 
         log(f"[Groq] corrected {changes}/{len(segments)} segments")

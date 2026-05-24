@@ -3,9 +3,16 @@
 // ── Build identity ─────────────────────────────────────────────────────────────
 // Bump this string whenever playback logic changes so you can verify the
 // deployed version in DevTools → Console without reading minified bundles.
-const PLAYBACK_BUILD = "2026-05-23 pure-bsearch-v1";
+const PLAYBACK_BUILD = "2026-05-24 antistall-v1";
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+// ── Anti-stall constants ───────────────────────────────────────────────────────
+// Safety net for lines whose backend display window is longer than any real lyric.
+// Backend already caps at 10 s; these fire only if a line somehow gets stuck.
+const MAX_ACTIVE_DURATION_S = 10.0;   // force-exit after this long on one line
+const LONG_PAUSE_ESCAPE_S   = 1.2;    // silence gap above which tighter cap applies
+const LONG_PAUSE_MAX_MULT   = 0.6;    // tighter cap = MAX_ACTIVE_DURATION_S × this
+
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
   Play, Pause, Loader2, CheckCircle2, XCircle, Zap,
   ChevronDown, ChevronUp, Terminal, BookOpen, MousePointer2, Copy, Check,
@@ -84,13 +91,14 @@ function findActiveLine(lines: LyricLine[], t: number): number {
   let lo = 0, hi = lines.length - 1;
   while (lo < hi) {
     const mid = Math.ceil((lo + hi) / 2);
-    if (lines[mid].startTime <= t) lo = mid; else hi = mid - 1;
+    if ((lines[mid]?.startTime ?? Infinity) <= t) lo = mid; else hi = mid - 1;
   }
 
   // lo is now the candidate: last line whose start has been reached
-  if (lines[lo].startTime > t) return -1;           // t is before all lines
-  if (t <= lines[lo].endTime)  return lo;            // t is inside this line
-  return -1;                                         // t is in a gap after this line
+  const candidate = lines[lo];
+  if (!candidate || candidate.startTime > t) return -1;  // t is before all lines
+  if (t <= candidate.endTime)                return lo;   // t is inside this line
+  return -1;                                              // t is in a gap after this line
 }
 
 // ── Step row ───────────────────────────────────────────────────────────────────
@@ -307,7 +315,6 @@ export function KaraokePlayer({
   const [job, setJob]               = useState<Job | null>(null);
   const [lyrics, setLyrics]         = useState<LyricLine[]>(initialLyrics);
   const [isPlaying, setIsPlaying]       = useState(false);
-  const [currentTime, setCurrentTime]   = useState(0);
   const [submitError, setSubmitError]   = useState<string | null>(null);
   const [isSyncingLyrics, setIsSyncing]         = useState(false);
   const [isFetchingLyrics, setIsFetchingLyrics] = useState(false);
@@ -317,13 +324,25 @@ export function KaraokePlayer({
   const [pasteError, setPasteError]     = useState<string | null>(null);
   const [isPasteLoading, setIsPasteLoading] = useState(false);
   const [completedLogs, setCompletedLogs] = useState<JobLogEntry[]>([]);
+  const [showTiming, setShowTiming]       = useState(false);
   const pollRef                         = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // ── YouTube player refs ───────────────────────────────────────────────────────
   const ytPlayerRef        = useRef<YTPlayer | null>(null);
   const playerContainerRef = useRef<HTMLDivElement>(null);
-  const timeIntervalRef    = useRef<ReturnType<typeof setInterval> | null>(null);
   const activeLineRef      = useRef<HTMLDivElement | null>(null);
+
+  // ── rAF-based timing refs — never stored in React state ──────────────────────
+  // The rAF loop reads all of these directly, so it never captures a stale
+  // closure and never needs to be recreated when component state changes.
+  const rafHandleRef      = useRef<number>(0);
+  const currentTimeRef    = useRef<number>(0);
+  const activeIdxRef      = useRef<number>(-1);
+  const isPlayingRef      = useRef<boolean>(false);
+  const antiStallLineRef  = useRef<number>(-1);   // tracks which line triggered anti-stall (suppress repeat logs)
+  // Initialized with initialLyrics so the loop is correct on the very first tick,
+  // before any lyrics-change effect has fired.
+  const lyricsRef      = useRef<LyricLine[]>(initialLyrics);
 
   // ── Vocab / selection state ───────────────────────────────────────────────────
   const [vocabState, setVocabState]         = useState<VocabState | null>(null);
@@ -339,12 +358,20 @@ export function KaraokePlayer({
   // lyrics is already sorted and finalized by the backend. No client-side mutations.
   const processedLyrics = lyrics;
 
-  // Pure time-based lookup — O(log n), stateless, deterministic.
-  // activeLine = f(currentTime, lyrics[]). No pointer, no advancement loops.
-  const activeIdx = useMemo(
-    () => findActiveLine(processedLyrics, currentTime),
-    [currentTime, processedLyrics],
-  );
+  // Mirror lyrics into a ref so the rAF loop reads the latest array without
+  // capturing a stale closure.  Also resets the active index so a highlight
+  // from a previous lyric set can never briefly appear over fresh lyrics.
+  useEffect(() => {
+    lyricsRef.current    = lyrics;
+    activeIdxRef.current = -1;
+    setActiveIdx(-1);
+  }, [lyrics]);
+
+  // activeIdx is driven by the rAF loop, not by useMemo.
+  // React state is updated only when the active line actually changes,
+  // so renders happen at line-change frequency (~0.5–3 Hz) rather than
+  // at clock-poll frequency (100 Hz with setInterval, 60 Hz with rAF).
+  const [activeIdx, setActiveIdx] = useState(-1);
 
   const activeLine = activeIdx >= 0 ? processedLyrics[activeIdx] : null;
 
@@ -431,17 +458,67 @@ export function KaraokePlayer({
   useEffect(() => {
     if (typeof window === "undefined") return;
 
-    const startInterval = () => {
-      if (timeIntervalRef.current) clearInterval(timeIntervalRef.current);
-      timeIntervalRef.current = setInterval(() => {
-        if (ytPlayerRef.current) setCurrentTime(ytPlayerRef.current.getCurrentTime());
-      }, 100);
-    };
+    // ── rAF clock loop ───────────────────────────────────────────────────────
+    // Declared as a named function expression inside the effect so it can
+    // reference itself by name for self-scheduling — no useCallback needed,
+    // no stale-closure risk because every value is read through a ref.
+    //
+    // The loop runs continuously from mount to unmount.  isPlayingRef gates
+    // whether getCurrentTime() is called; when paused, the loop idles at
+    // ~0 μs/frame (one ref read + one rAF schedule).  This is cheaper than
+    // starting and stopping the loop on every play/pause event.
+    function tick() {
+      rafHandleRef.current = requestAnimationFrame(tick);
 
-    const stopInterval = () => {
-      if (timeIntervalRef.current) { clearInterval(timeIntervalRef.current); timeIntervalRef.current = null; }
-    };
+      if (!isPlayingRef.current || !ytPlayerRef.current) return;
 
+      const t = ytPlayerRef.current.getCurrentTime();
+      currentTimeRef.current = t;
+
+      // findActiveLine is O(log n) and stateless — safe to call every frame.
+      const idx = findActiveLine(lyricsRef.current, t);
+
+      // Anti-stall safety net: if a line has been active longer than
+      // MAX_ACTIVE_DURATION_S, force-exit it regardless of endTime.
+      // The backend already caps display windows at 10 s; this only fires
+      // when something slips through (e.g. very long contiguous lines).
+      // When the preceding silence gap exceeds LONG_PAUSE_ESCAPE_S the cap
+      // tightens to 60 % — lines after pauses have no excuse to linger.
+      let displayIdx = idx;
+      if (idx !== -1) {
+        const line     = lyricsRef.current[idx];
+        const prevLine = idx > 0 ? lyricsRef.current[idx - 1] : null;
+        const silenceGap   = prevLine ? Math.max(0, line.startTime - prevLine.endTime) : 0;
+        const maxDuration  = silenceGap > LONG_PAUSE_ESCAPE_S
+          ? MAX_ACTIVE_DURATION_S * LONG_PAUSE_MAX_MULT
+          : MAX_ACTIVE_DURATION_S;
+        const activeDuration = t - line.startTime;
+        if (activeDuration > maxDuration) {
+          displayIdx = -1;
+          if (antiStallLineRef.current !== idx) {
+            antiStallLineRef.current = idx;
+            console.warn(
+              `[karaoke-antistall] L${idx} forced exit: ` +
+              `active=${activeDuration.toFixed(2)}s max=${maxDuration.toFixed(1)}s ` +
+              `silenceGap=${silenceGap.toFixed(2)}s endTime=${line.endTime.toFixed(3)}s`
+            );
+          }
+        } else {
+          antiStallLineRef.current = -1;
+        }
+      }
+
+      // Only schedule a React re-render when the active line actually changes.
+      // This is the key difference from the setInterval approach: the clock
+      // ticks at 60 Hz but React renders at line-change frequency only.
+      if (displayIdx !== activeIdxRef.current) {
+        activeIdxRef.current = displayIdx;
+        setActiveIdx(displayIdx);
+      }
+    }
+    rafHandleRef.current = requestAnimationFrame(tick);
+
+    // ── YouTube IFrame player ────────────────────────────────────────────────
     const initPlayer = () => {
       if (!playerContainerRef.current || !window.YT?.Player) return;
       ytPlayerRef.current = new window.YT.Player(playerContainerRef.current, {
@@ -449,8 +526,12 @@ export function KaraokePlayer({
         playerVars: { enablejsapi: 1, origin: window.location.origin },
         events: {
           onStateChange: (e: { data: number }) => {
-            if (e.data === 1) { setIsPlaying(true);  startInterval(); }
-            else              { setIsPlaying(false); stopInterval();  }
+            // 1 = YT.PlayerState.PLAYING; all other states (paused, buffering,
+            // ended) stop the clock.  Both the ref and the state are updated
+            // together: the ref gates the rAF loop; the state drives the UI.
+            const playing = e.data === 1;
+            isPlayingRef.current = playing;
+            setIsPlaying(playing);
           },
         },
       });
@@ -468,7 +549,7 @@ export function KaraokePlayer({
     }
 
     return () => {
-      stopInterval();
+      cancelAnimationFrame(rafHandleRef.current);
       ytPlayerRef.current?.destroy();
       ytPlayerRef.current = null;
     };
@@ -700,6 +781,62 @@ export function KaraokePlayer({
             </Button>
           </CardContent>
         </Card>
+      )}
+
+      {/* Timing debug panel */}
+      {lyrics.length > 0 && (
+        <div>
+          <button
+            onClick={() => setShowTiming((v) => !v)}
+            className="flex items-center gap-1.5 text-xs text-muted-foreground hover:text-foreground transition-colors"
+          >
+            {showTiming ? <ChevronUp className="h-3.5 w-3.5" /> : <ChevronDown className="h-3.5 w-3.5" />}
+            {showTiming ? "Hide timing" : "Show timing"}
+          </button>
+          {showTiming && (
+            <div className="mt-2 overflow-x-auto rounded-lg border text-xs font-mono">
+              <table className="w-full border-collapse">
+                <thead>
+                  <tr className="border-b bg-muted/50 text-left">
+                    <th className="px-3 py-2 text-muted-foreground">#</th>
+                    <th className="px-3 py-2 text-muted-foreground">Start</th>
+                    <th className="px-3 py-2 text-muted-foreground">End</th>
+                    <th className="px-3 py-2 text-muted-foreground">Dur</th>
+                    <th className="px-3 py-2 text-muted-foreground">Gap</th>
+                    <th className="px-3 py-2 text-muted-foreground">Text</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {lyrics.map((line, i) => {
+                    const st       = Number(line.startTime);
+                    const et       = Number(line.endTime);
+                    const prev     = i > 0 ? lyrics[i - 1] : null;
+                    const gap      = prev != null ? st - Number(prev.endTime) : null;
+                    const dur      = et - st;
+                    const isActive = activeIdx === i;
+                    return (
+                      <tr
+                        key={line.id ?? i}
+                        className={`border-b last:border-0 ${isActive ? "bg-primary/10" : "hover:bg-muted/40"}`}
+                      >
+                        <td className="px-3 py-1.5 text-muted-foreground">{i.toString().padStart(2, "0")}</td>
+                        <td className="px-3 py-1.5 tabular-nums">{st.toFixed(3)}</td>
+                        <td className="px-3 py-1.5 tabular-nums">{et.toFixed(3)}</td>
+                        <td className={`px-3 py-1.5 tabular-nums ${dur >= 9.9 ? "text-amber-500 font-semibold" : ""}`}>
+                          {dur.toFixed(2)}s
+                        </td>
+                        <td className="px-3 py-1.5 tabular-nums text-muted-foreground">
+                          {gap != null ? (gap < 0.01 ? "—" : `+${gap.toFixed(2)}s`) : ""}
+                        </td>
+                        <td className="px-3 py-1.5 font-japanese max-w-xs truncate">{line.text}</td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </div>
       )}
 
       {/* Syncing indicator */}

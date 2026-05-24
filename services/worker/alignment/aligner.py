@@ -1432,17 +1432,36 @@ def _align_whisperx_with_official_lyrics(
                     )
                     source = 'char_boundary'
 
-                    # Safeguard on char result — fall back to proportional if still bad
+                    # Safeguard on char result — try relaxed limit before proportional
                     bad, reason = _is_pathological_split(candidates)
                     if bad:
-                        if job_log:
-                            job_log.warning(
-                                f"[safeguard] Seg{i}: char progression rejected — {reason} "
-                                f"— falling back to proportional",
-                                stage="transcribe",
-                            )
-                        candidates = _proportional_line(orig_seg, line_texts)
-                        source     = 'proportional'
+                        # Intermediate check: accept if ratio is only moderately
+                        # extreme (< relaxed limit) AND min_dur is above the display
+                        # floor. Char timestamps are acoustically real even when the
+                        # ratio is high — proportional would discard that information.
+                        bad_relaxed, _ = _is_pathological_split(
+                            candidates, max_ratio=_SAFEGUARD_MAX_RATIO_RELAXED
+                        )
+                        if not bad_relaxed:
+                            if job_log:
+                                job_log.info(
+                                    f"[fallback] Seg{i}: char_progression "
+                                    f"char_progression=borderline({reason}) "
+                                    f"fallback=char_boundary_relaxed "
+                                    f"reason=ratio_within_relaxed_limit({_SAFEGUARD_MAX_RATIO_RELAXED}x)",
+                                    stage="transcribe",
+                                )
+                            source = 'char_boundary'
+                        else:
+                            if job_log:
+                                job_log.warning(
+                                    f"[fallback] Seg{i}: char_progression=rejected({reason}) "
+                                    f"fallback=proportional "
+                                    f"reason=ratio_exceeded_relaxed_limit",
+                                    stage="transcribe",
+                                )
+                            candidates = _proportional_line(orig_seg, line_texts)
+                            source     = 'proportional'
                     else:
                         _log_token_map(candidates, i, job_log)
                         _compare_splits(
@@ -1898,10 +1917,14 @@ def _split_by_char_progression(
 
 _SAFEGUARD_MIN_DUR_S      = 0.40   # any line shorter than this triggers rejection
 _SAFEGUARD_MAX_RATIO      = 8.0    # longest/shortest duration ratio ceiling
+_SAFEGUARD_MAX_RATIO_RELAXED = 12.0  # relaxed limit used as intermediate before proportional
 _SAFEGUARD_MAX_1WORD_FRAC = 0.50   # max fraction of lines with ≤1 word token
 
 
-def _is_pathological_split(candidates: list[dict]) -> tuple[bool, str]:
+def _is_pathological_split(
+    candidates: list[dict],
+    max_ratio: float | None = None,
+) -> tuple[bool, str]:
     """
     Return (True, reason) when acoustic word-gap splitting produced unusable output.
 
@@ -1912,9 +1935,13 @@ def _is_pathological_split(candidates: list[dict]) -> tuple[bool, str]:
 
     A rejected split falls back to proportional distribution so the song
     never gets 0.02 s lines or one line swallowing 26 seconds.
+
+    max_ratio: override the ratio ceiling (used for relaxed intermediate check).
     """
     if len(candidates) <= 1:
         return False, ""
+
+    effective_max_ratio = max_ratio if max_ratio is not None else _SAFEGUARD_MAX_RATIO
 
     durations = [max(0.0, c.get('end', 0.0) - c.get('start', 0.0)) for c in candidates]
     min_dur   = min(durations)
@@ -1923,10 +1950,10 @@ def _is_pathological_split(candidates: list[dict]) -> tuple[bool, str]:
     if min_dur < _SAFEGUARD_MIN_DUR_S:
         return True, f"ultra-short line: min_dur={min_dur:.3f}s"
 
-    if min_dur > 0 and max_dur / min_dur > _SAFEGUARD_MAX_RATIO:
+    if min_dur > 0 and max_dur / min_dur > effective_max_ratio:
         return True, (
             f"extreme ratio: {max_dur:.2f}s/{min_dur:.2f}s "
-            f"= {max_dur/min_dur:.1f}× (limit {_SAFEGUARD_MAX_RATIO}×)"
+            f"= {max_dur/min_dur:.1f}× (limit {effective_max_ratio}×)"
         )
 
     n_sparse = sum(1 for c in candidates if len(c.get('words', [])) <= 1)
