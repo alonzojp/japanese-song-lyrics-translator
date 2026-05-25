@@ -42,6 +42,15 @@ async function main() {
   await prisma.$executeRawUnsafe(
     `CREATE INDEX IF NOT EXISTS "LyricLine_songId_lineIndex_idx" ON "LyricLine"("songId", "lineIndex")`
   );
+
+  // Backfill columns added after initial schema (SQLite has no IF NOT EXISTS for columns).
+  for (const col of [
+    `ALTER TABLE "LyricLine" ADD COLUMN "acousticStart" REAL`,
+    `ALTER TABLE "LyricLine" ADD COLUMN "acousticEnd"   REAL`,
+  ]) {
+    try { await prisma.$executeRawUnsafe(col); } catch (_) { /* column already exists */ }
+  }
+
   await prisma.$disconnect();
   console.log("Database initialized");
 }
