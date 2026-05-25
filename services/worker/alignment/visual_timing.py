@@ -496,6 +496,17 @@ def visual_timing_normalization(lines: list[dict], job_log=None) -> list[dict]:
                 _ews_wend = _ews_w.get('end')
                 if _ews_w.get('start') is None or _ews_wend is None:
                     continue
+                # Bleed-tail patterns only occur when very little real lyric content
+                # exists before the stretched word. If substantial sung content already
+                # occurred, this is likely a legitimate held note inside the phrase.
+                _ews_prior_dur = sum(
+                    float(_line_words[j].get('end', 0)) - float(_line_words[j].get('start', 0))
+                    for j in range(_ews_k)
+                    if _line_words[j].get('start') is not None
+                    and _line_words[j].get('end') is not None
+                )
+                if _ews_prior_dur > 1.5:
+                    break
                 _ews_dur = float(_ews_wend) - float(_ews_w['start'])
                 if _ews_dur <= 1.2:
                     continue
