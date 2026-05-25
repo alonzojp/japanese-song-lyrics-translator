@@ -3,7 +3,7 @@
 // ── Build identity ─────────────────────────────────────────────────────────────
 // Bump this string whenever playback logic changes so you can verify the
 // deployed version in DevTools → Console without reading minified bundles.
-const PLAYBACK_BUILD = "2026-05-24 onset-v1";
+const PLAYBACK_BUILD = "2026-05-24 antistall-v2";
 
 // ── Anti-stall constants ───────────────────────────────────────────────────────
 // Safety net for lines whose backend display window is longer than any real lyric.
@@ -489,9 +489,10 @@ export function KaraokePlayer({
         const line     = lyricsRef.current[idx];
         const prevLine = idx > 0 ? lyricsRef.current[idx - 1] : null;
         const silenceGap   = prevLine ? Math.max(0, (line.acousticStart ?? line.startTime) - prevLine.endTime) : 0;
+        const backendWindow = line.endTime - line.startTime;
         const maxDuration  = silenceGap > LONG_PAUSE_ESCAPE_S
-          ? MAX_ACTIVE_DURATION_S * LONG_PAUSE_MAX_MULT
-          : MAX_ACTIVE_DURATION_S;
+          ? Math.max(MAX_ACTIVE_DURATION_S * LONG_PAUSE_MAX_MULT, backendWindow)
+          : Math.max(MAX_ACTIVE_DURATION_S, backendWindow);
         const activeDuration = t - line.startTime;
         if (activeDuration > maxDuration) {
           displayIdx = -1;
