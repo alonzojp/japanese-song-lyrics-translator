@@ -90,9 +90,10 @@ _SUSTAIN_MULT_SOFT_HIGH = 0.90   # SOFT + line_ratio > 2.5 → stronger compress
 # Separates acoustic_start (VAD boundary) from vocal_onset (first voiced content)
 # so anti-stall budget and display start are anchored to actual singing, not to
 # the segment boundary that may include breath, sparse piano, or pre-vocal silence.
-_ONSET_MIN_SHIFT_S = 0.05   # ignore shifts smaller than this (noise floor)
-_ONSET_MAX_SHIFT_S = 3.0    # safety: never push startTime forward more than this
-_ONSET_PRELOAD_S   = 0.10   # UX lead — line is visible just before first word
+_ONSET_MIN_SHIFT_S      = 0.05  # ignore shifts smaller than this (noise floor)
+_ONSET_MAX_SHIFT_S      = 3.0   # vad_anchor: max shift from acoustic_start
+_FIRST_WORD_MAX_SHIFT_S = 6.0   # first_word: accepts larger DTW-split gaps (CTC timestamps reliable)
+_ONSET_PRELOAD_S        = 0.10  # UX lead — line is visible just before first word
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -478,55 +479,57 @@ def visual_timing_normalization(lines: list[dict], job_log=None) -> list[dict]:
                 if _ws is not None:
                     _fw_start_log = float(_ws)
                     _shift = _fw_start_log - a_start
-                    if _ONSET_MIN_SHIFT_S <= _shift <= _ONSET_MAX_SHIFT_S:
+                    if _ONSET_MIN_SHIFT_S <= _shift <= _FIRST_WORD_MAX_SHIFT_S:
                         _vocal_onset  = _fw_start_log
                         _onset_source = 'first_word'
                     break
 
-        # Phase 0 third fallback: collapsed-first-word detection.
-        # Fires when both vad_anchor and first_word.start gave zero shift,
-        # but the first word's duration is anomalously long relative to subsequent
-        # words — indicating CTC absorbed pre-vocal silence into the first word span.
+        # Phase 0 third fallback: early-word stretch scanner.
+        # Scans words k=0..3 for a word whose duration is anomalously long relative
+        # to the following words — indicating CTC absorbed pre-vocal silence or a
+        # cross-boundary bleed tail into that word's span.  Generalises the original
+        # collapsed-first-word heuristic (k=0 only) to positions k=1, 2, 3, catching
+        # bleed-tail patterns where the stretched word is not the first in the line.
         if _onset_source == 'acoustic' and len(_line_words) >= 3:
-            _cfw_fw      = _line_words[0]
-            _cfw_fw_start = _cfw_fw.get('start')
-            _cfw_fw_end   = _cfw_fw.get('end')
-            if _cfw_fw_start is not None and _cfw_fw_end is not None:
-                _cfw_fw_dur = float(_cfw_fw_end) - float(_cfw_fw_start)
-                _cfw_next_slice = _line_words[1:5]
-                _cfw_next_durs = [
+            for _ews_k in range(min(4, len(_line_words) - 2)):
+                _ews_w    = _line_words[_ews_k]
+                _ews_wend = _ews_w.get('end')
+                if _ews_w.get('start') is None or _ews_wend is None:
+                    continue
+                _ews_dur = float(_ews_wend) - float(_ews_w['start'])
+                if _ews_dur <= 1.2:
+                    continue
+                _ews_next_durs = [
                     float(w['end']) - float(w['start'])
-                    for w in _cfw_next_slice
+                    for w in _line_words[_ews_k + 1 : _ews_k + 5]
                     if w.get('start') is not None and w.get('end') is not None
                 ]
-                if _cfw_next_durs:
-                    _cfw_nd_sorted   = sorted(_cfw_next_durs)
-                    _cfw_median_next = _cfw_nd_sorted[len(_cfw_nd_sorted) // 2]
-                    _cfw_ratio       = _cfw_fw_dur / _cfw_median_next if _cfw_median_next > 0 else 0.0
-
-                    if (_cfw_median_next >= 0.12        # not fast rap
-                            and _cfw_fw_dur > 1.2       # first word is long
-                            and _cfw_ratio > 3.0):      # and anomalously longer than peers
-
-                        _cfw_fw_end_f  = float(_cfw_fw_end)
-                        _cfw_est_onset = _cfw_fw_end_f - min(_cfw_median_next * 1.2, _cfw_fw_dur * 0.45)
-                        _cfw_est_onset = min(_cfw_est_onset, _cfw_fw_end_f - 0.12)  # safety floor
-                        _cfw_shift     = _cfw_est_onset - a_start
-                        if _ONSET_MIN_SHIFT_S <= _cfw_shift <= 2.5:
-                            _vocal_onset  = _cfw_est_onset
-                            _onset_source = 'collapsed_first_word'
-                            if job_log:
-                                job_log.info(
-                                    f"[collapsed_onset] L{i:02d}: "
-                                    f"acoustic_start={a_start:.3f}s "
-                                    f"first_word={_cfw_fw.get('word', '?')!r} "
-                                    f"first_word_duration={_cfw_fw_dur:.3f}s "
-                                    f"median_next_duration={_cfw_median_next:.3f}s "
-                                    f"ratio={_cfw_ratio:.2f} "
-                                    f"inferred_onset={_vocal_onset:.3f}s "
-                                    f"shift_ms={round(_cfw_shift * 1000):.0f}",
-                                    stage="align",
-                                )
+                if not _ews_next_durs:
+                    continue
+                _ews_sorted      = sorted(_ews_next_durs)
+                _ews_median_next = _ews_sorted[len(_ews_sorted) // 2]
+                _ews_ratio       = _ews_dur / _ews_median_next if _ews_median_next > 0 else 0.0
+                if _ews_median_next >= 0.12 and _ews_ratio > 3.0:
+                    _ews_end_f = float(_ews_wend)
+                    _ews_onset = _ews_end_f - min(_ews_median_next * 1.2, _ews_dur * 0.45)
+                    _ews_onset = min(_ews_onset, _ews_end_f - 0.12)
+                    _ews_shift = _ews_onset - a_start
+                    if _ONSET_MIN_SHIFT_S <= _ews_shift <= 6.0:
+                        _vocal_onset  = _ews_onset
+                        _onset_source = 'early_word_stretch'
+                        if job_log:
+                            job_log.info(
+                                f"[early_word_stretch] L{i:02d}: "
+                                f"k={_ews_k} "
+                                f"word={_ews_w.get('word', '?')!r} "
+                                f"duration={_ews_dur:.3f}s "
+                                f"median_next={_ews_median_next:.3f}s "
+                                f"ratio={_ews_ratio:.2f} "
+                                f"inferred_onset={_vocal_onset:.3f}s "
+                                f"shift_ms={round(_ews_shift * 1000):.0f}",
+                                stage="align",
+                            )
+                        break
 
         # Preload: line activates _ONSET_PRELOAD_S before vocal onset so the UI
         # has time to scroll and the viewer sees the line just before singing.
