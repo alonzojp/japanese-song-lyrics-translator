@@ -1282,6 +1282,35 @@ def _align_whisperx_with_official_lyrics(
     from alignment.debug import AlignmentDebugger
     _dbg = AlignmentDebugger(len(rough_segments), len(official_lines))
 
+    # ── 1a. LOW_CONF reassignment ─────────────────────────────────────────────
+    # Lines assigned with sim=0.00 against their segment often ended up there
+    # because the DP's mean_sim objective pushed them past the segment that
+    # actually contains their text.  Check the previous segment: if it scores
+    # better (> threshold), move the line there to get correct audio window.
+    _REASSIGN_MIN_SIM  = 0.12   # previous segment must beat this to accept
+    _REASSIGN_BAD_SIM  = 0.05   # current assignment must be below this
+
+    for _rci in range(1, len(rough_segments)):
+        _lines_rci = seg_to_lines.get(_rci, [])
+        if not _lines_rci:
+            continue
+        _first_line  = _lines_rci[0]
+        _cur_text    = rough_segments[_rci].get('text', '')
+        _sim_current = _text_similarity(_first_line, _cur_text)
+        if _sim_current >= _REASSIGN_BAD_SIM:
+            continue
+        _prev_text = rough_segments[_rci - 1].get('text', '')
+        _sim_prev  = _text_similarity(_first_line, _prev_text)
+        if _sim_prev > _REASSIGN_MIN_SIM:
+            seg_to_lines[_rci]     = _lines_rci[1:]
+            seg_to_lines[_rci - 1] = seg_to_lines.get(_rci - 1, []) + [_first_line]
+            if job_log:
+                job_log.info(
+                    f"[reassign] '{_first_line[:35]}' moved Seg{_rci}→Seg{_rci-1} "
+                    f"(sim_cur={_sim_current:.2f} sim_prev={_sim_prev:.2f})",
+                    stage="transcribe",
+                )
+
     # ── Collapse detection ────────────────────────────────────────────────────
     # Warn when a segment window is too short for its assigned lines.
     # These segments will use silence detection (not proportional distribution)

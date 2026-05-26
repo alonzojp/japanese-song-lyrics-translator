@@ -303,8 +303,9 @@ def _norm_chars(text: str) -> str:
     """Normalize text to bare CJK/kana/alnum for character-level matching."""
     s = unicodedata.normalize('NFKC', text)
     s = _kata_to_hira(s)
+    s = s.lower()   # lowercase BEFORE regex so 'T'→'t' is kept by [a-z]
     s = re.sub(r'[^぀-ゟ一-鿿㐀-䶿a-z0-9]', '', s)
-    return s.lower()
+    return s
 
 
 # ── Hybrid timing: bridge DTW char-level gaps ──────────────────────────────────
