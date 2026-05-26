@@ -586,6 +586,24 @@ export function KaraokePlayer({
     }
   }
 
+  // Reprocess: bust the alignment cache first so force_align + text-first
+  // reconstruction actually re-run, then submit a new job.
+  async function reprocess() {
+    setSubmitError(null);
+    try {
+      const res = await fetch(`/api/cache/${youtubeId}/force-align`, { method: "DELETE" });
+      if (!res.ok) {
+        const { error } = (await res.json().catch(() => ({}))) as { error?: string };
+        // 404 = not yet cached; that's fine, just submit the job directly
+        if (res.status !== 404) throw new Error(error ?? "Cache invalidation failed");
+      }
+    } catch (err) {
+      setSubmitError(err instanceof Error ? err.message : "Failed to clear cache");
+      return;
+    }
+    await submitJob();
+  }
+
   // ── NLP analysis ─────────────────────────────────────────────────────────────
 
   async function handleAnalyze() {
@@ -870,7 +888,7 @@ export function KaraokePlayer({
 
                 {/* Reprocess */}
                 {isDone && (
-                  <Button variant="ghost" size="sm" onClick={submitJob} className="gap-1.5 text-muted-foreground">
+                  <Button variant="ghost" size="sm" onClick={reprocess} className="gap-1.5 text-muted-foreground">
                     <Zap className="h-3.5 w-3.5" />
                     Reprocess
                   </Button>

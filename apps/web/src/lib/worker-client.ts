@@ -71,4 +71,8 @@ export const workerClient = {
   getBestLogs(youtubeId: string): Promise<{ youtubeId: string; logCount: number; logs: JobLogEntry[] }> {
     return workerFetch(`/cache/${youtubeId}/logs`);
   },
+
+  invalidateForceAlign(youtubeId: string): Promise<{ youtubeId: string; invalidatedStages: string[]; removedFiles: string[] }> {
+    return workerFetch(`/cache/${youtubeId}/force-align`, { method: "DELETE" });
+  },
 };

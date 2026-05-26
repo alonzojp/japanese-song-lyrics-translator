@@ -188,6 +188,55 @@ async def invalidate_postprocess(youtube_id: str) -> dict:
     }
 
 
+@app.delete("/cache/{youtube_id}/force-align")
+async def invalidate_force_align(youtube_id: str) -> dict:
+    """
+    Re-run force_align (and text-first reconstruction) WITHOUT re-running Whisper.
+
+    Deletes aligned_words.json so the version-mismatch fallback in transcribe.py
+    calls force_align again using the cached transcript.json.  Also clears all
+    post-processing outputs so the full pipeline re-runs from force_align onward.
+
+    Use this as the Reprocess button's cache-busting step: faster than /alignment
+    (no Whisper re-run) while still picking up algorithm changes in force_align /
+    text_first.py.
+    """
+    from config import CACHE_DIR
+    target = CACHE_DIR / youtube_id
+    if not target.exists():
+        raise HTTPException(status_code=404, detail="Not in cache")
+
+    from cache import invalidate_stage
+    # Invalidate both stages so the pipeline re-runs from force_align onward.
+    # transcript.json is intentionally kept — Whisper will NOT re-run.
+    invalidate_stage(youtube_id, "transcribe")
+    invalidate_stage(youtube_id, "align")
+
+    _files = [
+        "aligned_words.json",       # forces force_align to re-run
+        "aligned_lines.json",
+        "alignment_meta.json",
+        "alignment_selection.json",
+        "canonical_lines.json",
+        "matched_lyrics.json",
+        "alignment_diagnostic.txt",
+        "alignment_debug.json",
+        "lyrics.json",
+    ]
+    removed = []
+    for name in _files:
+        p = target / name
+        if p.exists():
+            p.unlink()
+            removed.append(name)
+
+    return {
+        "youtubeId":         youtube_id,
+        "invalidatedStages": ["transcribe", "align"],
+        "removedFiles":      removed,
+    }
+
+
 # ── Jobs ───────────────────────────────────────────────────────────────────────
 
 @app.post("/jobs", status_code=201)
