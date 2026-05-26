@@ -282,6 +282,7 @@ def reconstruct_lines_text_first(
                         'word':  w.get('word', ''),
                         'start': round(float(w.get('start') or 0), 3),
                         'end':   round(float(w.get('end') or w.get('start') or 0), 3),
+                        'score': w.get('score', 1.0),
                     }
                     for w in matched
                 ],
