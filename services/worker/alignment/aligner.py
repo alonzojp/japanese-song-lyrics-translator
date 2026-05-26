@@ -1771,6 +1771,40 @@ def _align_whisperx_with_official_lyrics(
     except Exception as _de:
         logger.debug("alignment_debug.json write failed: %s", _de)
 
+    # ── Text-first reconstruction ──────────────────────────────────────────────
+    # Replace segment-boundary-constrained line timing with a global greedy
+    # word-to-lyric match that crosses segment boundaries freely.  Uses the
+    # VAD-corrected word timestamps already present in `final`.
+    try:
+        from alignment.text_first import reconstruct_lines_text_first
+
+        global_words: list[dict] = []
+        for _seg in final:
+            for _w in _seg.get('words', []):
+                if _w.get('start') is not None and _w.get('word'):
+                    global_words.append(_w)
+        global_words.sort(key=lambda _w: float(_w.get('start', 0)))
+
+        if global_words:
+            reconstructed = reconstruct_lines_text_first(
+                official_lines, global_words, job_log
+            )
+            if reconstructed:
+                if job_log:
+                    job_log.info(
+                        f"[text_first] Replaced {len(final)} segment-based lines "
+                        f"with {len(reconstructed)} text-first lines",
+                        stage="transcribe",
+                    )
+                return reconstructed, "whisperx_official"
+    except Exception as _tf_exc:
+        if job_log:
+            job_log.warning(
+                f"[text_first] Reconstruction failed ({_tf_exc}) — "
+                f"returning segment-based result",
+                stage="transcribe",
+            )
+
     return final, "whisperx_official"
 
 

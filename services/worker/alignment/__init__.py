@@ -4,6 +4,7 @@ from alignment.aligner       import force_align
 from alignment.line_builder  import build_lyric_lines
 from alignment.confidence    import compute_confidence, AlignmentConfidence
 from alignment.selector      import select_best_alignment
+from alignment.text_first    import reconstruct_lines_text_first
 from alignment.visual_timing import visual_timing_normalization, finalize_timeline, timeline_quality, pick_anchor
 from alignment.outputs       import (
     save_transcript,
@@ -24,6 +25,7 @@ __all__ = [
     "compute_confidence",
     "AlignmentConfidence",
     "select_best_alignment",
+    "reconstruct_lines_text_first",
     "visual_timing_normalization",
     "finalize_timeline",
     "timeline_quality",
