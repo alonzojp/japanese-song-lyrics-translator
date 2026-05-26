@@ -454,6 +454,10 @@ def _apply_char_timestamps(
 
     tx_str    = ''.join(c for c, _, _ in tx_chars)
     tx_cursor = 0
+    # Allow scanning a few positions back to recover from tx_cursor overrun.
+    # Overrun happens when the previous line's match window extends into the
+    # first character of the current line (common with wide-span char tokens).
+    _LOOKBACK = 3
     result: list[dict] = []
 
     for line in matched_lines:
@@ -463,9 +467,10 @@ def _apply_char_timestamps(
             result.append(line)
             continue
 
-        win        = max(1, len(line_norm))
-        search_end = min(len(tx_chars), tx_cursor + win + 100)
-        search_str = tx_str[tx_cursor:search_end]
+        win       = max(1, len(line_norm))
+        look_from = max(0, tx_cursor - _LOOKBACK)
+        search_end = min(len(tx_chars), look_from + win + 100)
+        search_str = tx_str[look_from:search_end]
 
         best_pos   = -1
         best_score = 0.0
@@ -475,14 +480,14 @@ def _apply_char_timestamps(
             score  = bigram_sim(line_norm, window)
             if score > best_score:
                 best_score = score
-                best_pos   = tx_cursor + offset
+                best_pos   = look_from + offset
 
         if best_pos >= 0 and best_score > 0.12:
             match_end  = min(best_pos + win - 1, len(tx_chars) - 1)
             start_t    = tx_chars[best_pos][1]
             end_t      = tx_chars[match_end][2]
             result.append({**line, 'startTime': start_t, 'endTime': end_t})
-            tx_cursor  = match_end + 1
+            tx_cursor  = max(tx_cursor, match_end + 1)   # never go backward
         else:
             result.append(line)
 

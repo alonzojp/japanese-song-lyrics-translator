@@ -1299,16 +1299,44 @@ def _align_whisperx_with_official_lyrics(
                 stage="transcribe",
             )
 
+    # ── 1b. Cross-segment window expansion ───────────────────────────────────
+    # When the last lyric line assigned to segment i has text that also matches
+    # the opening of segment i+1, WhisperX cannot align the full phrase because
+    # its window ends at seg[i].end.  Detect this and expand the window to
+    # cover seg[i+1].end so forced-alignment can reach the correct audio.
+    _CROSS_SEG_SIM_THRESHOLD = 0.15
+    cross_seg_expansions: dict[int, float] = {}   # seg_idx → expanded end time
+
+    for _csi in range(len(rough_segments) - 1):
+        _lines_here = seg_to_lines.get(_csi, [])
+        if not _lines_here:
+            continue
+        _last_line   = _lines_here[-1]
+        _next_seg    = rough_segments[_csi + 1]
+        _next_text   = _next_seg.get('text', '')
+        _sim_to_next = _text_similarity(_last_line, _next_text)
+        if _sim_to_next > _CROSS_SEG_SIM_THRESHOLD:
+            _expanded_end = float(_next_seg.get('end', rough_segments[_csi].get('end', 0.0)))
+            cross_seg_expansions[_csi] = _expanded_end
+            if job_log:
+                job_log.info(
+                    f"[cross_seg] Seg{_csi}: last assigned line crosses into seg{_csi+1} "
+                    f"(sim={_sim_to_next:.2f}) — expanding window "
+                    f"{rough_segments[_csi].get('end', 0.0):.3f}s → {_expanded_end:.3f}s",
+                    stage="transcribe",
+                )
+
     # ── 2. WhisperX acoustic alignment ───────────────────────────────────────
     new_segs:     list[dict]                  = []
     seg_line_map: list[Optional[list[str]]]   = []
 
     for i, seg in enumerate(rough_segments):
-        lines = seg_to_lines.get(i)
+        lines   = seg_to_lines.get(i)
+        seg_end = cross_seg_expansions.get(i, seg.get('end', 0.0))
         new_segs.append({
             'text':  ' '.join(lines) if lines else seg.get('text', ''),
             'start': seg.get('start', 0.0),
-            'end':   seg.get('end',   0.0),
+            'end':   seg_end,
         })
         seg_line_map.append(lines)
 
