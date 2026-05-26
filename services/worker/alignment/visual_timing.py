@@ -95,8 +95,26 @@ _ONSET_MAX_SHIFT_S      = 3.0   # vad_anchor: max shift from acoustic_start
 _FIRST_WORD_MAX_SHIFT_S = 6.0   # first_word: accepts larger DTW-split gaps (CTC timestamps reliable)
 _ONSET_PRELOAD_S        = 0.10  # UX lead — line is visible just before first word
 
+# ── Cross-line CTC hold detection ─────────────────────────────────────────────
+# When a kana/kanji last word is held anomalously long AND the very next line's
+# first word (a Latin/ASCII character) starts exactly where the hold ends, the
+# CTC model was still in the Japanese-script state while the Latin vocal onset
+# had already begun.  Infer the current line's onset from prev_last_word.start.
+_CROSS_HELD_MIN_DUR_S  = 1.2   # minimum duration for a "held" CTC last word
+_CROSS_HELD_MIN_RATIO  = 2.5   # ratio vs median of preceding words
+_CROSS_HELD_GAP_S      = 0.05  # max gap between prev_last_word.end and cur_first_word.start
+
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _is_kana_or_cjk(ch: str) -> bool:
+    if not ch:
+        return False
+    cp = ord(ch[0])
+    return (0x3040 <= cp <= 0x30FF or   # hiragana / katakana
+            0x4E00 <= cp <= 0x9FFF or   # CJK unified
+            0x3400 <= cp <= 0x4DBF)      # CJK extension A
+
 
 def _mora_count(text: str) -> int:
     count = 0
@@ -549,10 +567,67 @@ def visual_timing_normalization(lines: list[dict], job_log=None) -> list[dict]:
                             )
                         break
 
+        # Phase 0 fourth fallback: cross-line CTC hold correction.
+        # When a kana/CJK last word in the previous line was held anomalously long
+        # (the CTC model stayed in that state) and this line's first ASCII-Latin
+        # word starts exactly where the hold ended, the actual vocal onset of this
+        # line predates the CTC-marked first word start.  Infer onset from
+        # prev_last_word.start (when the CTC hold began).
+        #
+        # The script-boundary guard (kana → Latin) prevents false positives on
+        # genuine Japanese-to-Japanese held notes such as 'な'→'希' where both
+        # CTC timestamps are correct.
+        _prev_held_onset_bypass = False
+        if _onset_source in ('acoustic', 'first_word') and _line_words and i > 0:
+            _plws = lines[i - 1].get('words', [])
+            if _plws:
+                _plw       = _plws[-1]
+                _plw_s_raw = _plw.get('start')
+                _plw_e_raw = _plw.get('end')
+                _cfw_s_raw = _line_words[0].get('start')
+                if _plw_s_raw is not None and _plw_e_raw is not None and _cfw_s_raw is not None:
+                    _plw_dur  = float(_plw_e_raw) - float(_plw_s_raw)
+                    _cfw_gap  = abs(float(_cfw_s_raw) - float(_plw_e_raw))
+                    _plw_ch   = (_plw.get('word') or '').strip()[:1]
+                    _cfw_ch   = (_line_words[0].get('word') or '').strip()[:1]
+                    # Conditions: wide hold, abutting start, script crosses kana→Latin
+                    if (
+                        _plw_dur >= _CROSS_HELD_MIN_DUR_S
+                        and _cfw_gap <= _CROSS_HELD_GAP_S
+                        and _is_kana_or_cjk(_plw_ch)
+                        and _cfw_ch.isascii() and _cfw_ch.isalpha()
+                    ):
+                        _pl_durs = sorted([
+                            float(w['end']) - float(w['start'])
+                            for w in _plws[:-1]
+                            if w.get('start') is not None and w.get('end') is not None
+                        ])
+                        if _pl_durs:
+                            _pl_med = _pl_durs[len(_pl_durs) // 2]
+                            if _pl_med > 0 and _plw_dur / _pl_med >= _CROSS_HELD_MIN_RATIO:
+                                _vocal_onset = float(_plw_s_raw)
+                                _onset_source = 'prev_held_last_word'
+                                _prev_held_onset_bypass = True
+                                if job_log:
+                                    job_log.info(
+                                        f"[prev_held_onset] L{i:02d}: "
+                                        f"prev_last={_plw_ch!r} dur={_plw_dur:.3f}s "
+                                        f"prev_median={_pl_med:.3f}s "
+                                        f"ratio={_plw_dur / _pl_med:.2f} "
+                                        f"inferred_onset={_vocal_onset:.3f}s "
+                                        f"(bypassing a_start={a_start:.3f}s floor)",
+                                        stage="align",
+                                    )
+
         # Preload: line activates _ONSET_PRELOAD_S before vocal onset so the UI
         # has time to scroll and the viewer sees the line just before singing.
-        # Never before acoustic_start (no audio signal exists before that point).
-        _display_start  = max(a_start, _vocal_onset - _ONSET_PRELOAD_S)
+        # For cross-line CTC hold corrections the acoustic_start was itself set by
+        # the hold artifact — bypass the a_start floor so the display start
+        # reflects the actual vocal onset rather than the CTC boundary.
+        if _prev_held_onset_bypass:
+            _display_start = max(0.0, _vocal_onset - _ONSET_PRELOAD_S)
+        else:
+            _display_start = max(a_start, _vocal_onset - _ONSET_PRELOAD_S)
         _onset_shift_ms = round((_vocal_onset - a_start) * 1000.0, 1)
 
         # DTW-tail relaxation: when a CONT line's acousticEnd extends significantly
