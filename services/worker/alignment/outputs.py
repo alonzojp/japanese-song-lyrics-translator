@@ -26,7 +26,7 @@ CANONICAL_LINES_FILE = "canonical_lines.json"
 
 # Bump this string whenever alignment logic changes so stale aligned_words.json
 # files are automatically rejected and force_align() re-runs.
-ALIGNER_VERSION = "15"
+ALIGNER_VERSION = "16"
 
 
 def save_transcript(output_dir: Path, segments: list[dict], backend: str) -> Path:

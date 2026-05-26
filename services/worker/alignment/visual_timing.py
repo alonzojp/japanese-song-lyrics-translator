@@ -510,6 +510,13 @@ def visual_timing_normalization(lines: list[dict], job_log=None) -> list[dict]:
                 _ews_dur = float(_ews_wend) - float(_ews_w['start'])
                 if _ews_dur <= 1.2:
                     continue
+                # Single ASCII characters are CTC character-level tokens (e.g. 'T' in
+                # 'True').  Their wide span reflects the held consonant state, not
+                # a pre-bleed artefact — the vocal onset IS the token start, so
+                # skip the stretch inference for them.
+                _ews_word_text = _ews_w.get('word', '')
+                if len(_ews_word_text.strip()) == 1 and _ews_word_text.strip().isascii():
+                    continue
                 _ews_next_durs = [
                     float(w['end']) - float(w['start'])
                     for w in _line_words[_ews_k + 1 : _ews_k + 5]
