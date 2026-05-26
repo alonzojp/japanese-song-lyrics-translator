@@ -1299,30 +1299,63 @@ def _align_whisperx_with_official_lyrics(
                 stage="transcribe",
             )
 
-    # ── 1b. Cross-segment window expansion ───────────────────────────────────
+    # ── 1b. Cross-segment line splitting ─────────────────────────────────────
     # When the last lyric line assigned to segment i has text that also matches
-    # the opening of segment i+1, WhisperX cannot align the full phrase because
-    # its window ends at seg[i].end.  Detect this and expand the window to
-    # cover seg[i+1].end so forced-alignment can reach the correct audio.
+    # the opening of segment i+1, the vocalist pauses between the two halves
+    # and WhisperX will misplace the second half if forced into one continuous
+    # window.  Instead we SPLIT the line at the boundary:
+    #   seg i   → aligns only the first half within its original time window
+    #   seg i+1 → gets the second half prepended so it aligns in the correct
+    #             audio region (after the natural pause)
     _CROSS_SEG_SIM_THRESHOLD = 0.15
-    cross_seg_expansions: dict[int, float] = {}   # seg_idx → expanded end time
+    # seg_idx → trimmed text for last line of that segment
+    cross_seg_trim:    dict[int, str] = {}
+    # seg_idx → text to prepend at the start of that segment's alignment text
+    cross_seg_prepend: dict[int, str] = {}
 
     for _csi in range(len(rough_segments) - 1):
         _lines_here = seg_to_lines.get(_csi, [])
         if not _lines_here:
             continue
-        _last_line   = _lines_here[-1]
-        _next_seg    = rough_segments[_csi + 1]
-        _next_text   = _next_seg.get('text', '')
+        _last_line  = _lines_here[-1]
+        _next_seg   = rough_segments[_csi + 1]
+        _next_text  = _next_seg.get('text', '')
+        _seg_i_text = rough_segments[_csi].get('text', '')
         _sim_to_next = _text_similarity(_last_line, _next_text)
-        if _sim_to_next > _CROSS_SEG_SIM_THRESHOLD:
-            _expanded_end = float(_next_seg.get('end', rough_segments[_csi].get('end', 0.0)))
-            cross_seg_expansions[_csi] = _expanded_end
+
+        if _sim_to_next <= _CROSS_SEG_SIM_THRESHOLD:
+            continue
+
+        # Find best whitespace-boundary split: maximise sim(first, seg_i) + sim(second, seg_i+1)
+        _tokens     = _last_line.split()
+        _best_k     = 0   # 0 = no split found
+        _best_sim   = -1.0
+        for _k in range(1, len(_tokens)):
+            _first  = ' '.join(_tokens[:_k])
+            _second = ' '.join(_tokens[_k:])
+            _s = _text_similarity(_first, _seg_i_text) + _text_similarity(_second, _next_text)
+            if _s > _best_sim:
+                _best_sim = _s
+                _best_k   = _k
+
+        if _best_k > 0 and _best_k < len(_tokens):
+            _trim    = ' '.join(_tokens[:_best_k])
+            _prepend = ' '.join(_tokens[_best_k:])
+            cross_seg_trim[_csi]          = _trim
+            cross_seg_prepend[_csi + 1]   = _prepend
             if job_log:
                 job_log.info(
-                    f"[cross_seg] Seg{_csi}: last assigned line crosses into seg{_csi+1} "
-                    f"(sim={_sim_to_next:.2f}) — expanding window "
-                    f"{rough_segments[_csi].get('end', 0.0):.3f}s → {_expanded_end:.3f}s",
+                    f"[cross_seg] Seg{_csi}: splitting '{_last_line}' at token {_best_k} "
+                    f"(sim={_sim_to_next:.2f}) — "
+                    f"'{_trim}' stays in seg{_csi}, "
+                    f"'{_prepend}' prepended to seg{_csi + 1}",
+                    stage="transcribe",
+                )
+        else:
+            if job_log:
+                job_log.info(
+                    f"[cross_seg] Seg{_csi}: line crosses into seg{_csi+1} "
+                    f"(sim={_sim_to_next:.2f}) but no whitespace split found — skipping",
                     stage="transcribe",
                 )
 
@@ -1331,14 +1364,23 @@ def _align_whisperx_with_official_lyrics(
     seg_line_map: list[Optional[list[str]]]   = []
 
     for i, seg in enumerate(rough_segments):
-        lines   = seg_to_lines.get(i)
-        seg_end = cross_seg_expansions.get(i, seg.get('end', 0.0))
+        lines = list(seg_to_lines.get(i) or [])
+
+        # Apply cross-seg trim: replace the last line with its trimmed version
+        if i in cross_seg_trim and lines:
+            lines = lines[:-1] + [cross_seg_trim[i]]
+
+        # Apply cross-seg prepend: add split-off text from the previous segment
+        prepend = cross_seg_prepend.get(i, '')
+        if prepend:
+            lines = [prepend] + lines
+
         new_segs.append({
             'text':  ' '.join(lines) if lines else seg.get('text', ''),
             'start': seg.get('start', 0.0),
-            'end':   seg_end,
+            'end':   seg.get('end',   0.0),
         })
-        seg_line_map.append(lines)
+        seg_line_map.append(seg_to_lines.get(i))
 
     try:
         audio       = whisperx.load_audio(str(audio_path))
