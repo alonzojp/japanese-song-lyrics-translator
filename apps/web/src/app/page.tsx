@@ -5,6 +5,8 @@ import { YouTubeInput } from "@/components/youtube-input";
 import { Card, CardContent } from "@/components/ui/card";
 import { prisma } from "@/lib/prisma";
 
+export const dynamic = "force-dynamic";
+
 async function getRecentSongs() {
   try {
     return await prisma.song.findMany({
