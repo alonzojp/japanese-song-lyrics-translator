@@ -377,6 +377,51 @@ def run_job(job_id: str) -> None:
         # LLM correction — fix kanji/kana errors in Whisper output using Groq
         aligned_segments = correct_segments(aligned_segments, job_log=jl)
 
+        # ── Quality gate: detect catastrophic ASR failure ──────────────────────
+        # Fires before postprocess so we can swap in forced acoustic alignment
+        # when Whisper collapsed repeated choruses or produced unusable output.
+        # The gate is a no-op when official lyrics are not available.
+        if pre_lyrics:
+            try:
+                from alignment.acoustic_gate import detect_catastrophic_failure
+                from alignment.forced_aligner import run_forced_alignment
+
+                gate = detect_catastrophic_failure(
+                    segments=aligned_segments,
+                    official_lines=pre_lyrics,
+                    align_method=align_method,
+                    job_log=jl,
+                )
+                if gate.triggered:
+                    jl.info(
+                        f"[quality_gate] Switching to forced acoustic alignment — "
+                        f"{gate.reasons}",
+                        stage="align",
+                    )
+                    official_line_texts = [
+                        l["text"] for l in pre_lyrics
+                        if l.get("text", "").strip()
+                    ]
+                    forced_segs = run_forced_alignment(
+                        vocals_path=vocals_path,
+                        official_line_texts=official_line_texts,
+                        job_log=jl,
+                    )
+                    aligned_segments = forced_segs
+                    align_method     = "whisperx_forced"
+                    backend          = "forced_acoustic"
+                    jl.info(
+                        f"[quality_gate] Forced alignment produced "
+                        f"{len(forced_segs)} segments → continuing pipeline",
+                        stage="align",
+                    )
+            except Exception as gate_exc:
+                jl.warning(
+                    f"[quality_gate] Gate/forced-alignment failed (non-fatal, "
+                    f"using WhisperX output): {gate_exc}",
+                    stage="align",
+                )
+
         update_job_step(job_id, "transcribe", JobStatus.completed, 100, _WEIGHTS["transcribe"][1])
 
         # ── Step 4: Post-process → LyricLine files ─────────────────────────────

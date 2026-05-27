@@ -27,6 +27,7 @@ logger = logging.getLogger(__name__)
 # Acoustic methods that produced aligned_lines.json — higher = more trusted.
 _METHOD_TRUST: dict[str, float] = {
     "whisperx_official": 1.00,   # acoustic + correct lyrics text = gold standard
+    "whisperx_forced":   0.95,   # forced CTC alignment against known lyrics (bad-ASR rescue)
     "whisperx":          0.75,
     "faster-whisper":    0.70,
     "transcriber":       0.65,
@@ -41,6 +42,7 @@ _METHOD_TRUST: dict[str, float] = {
 # Higher-quality acoustic methods require a stronger DTW match before being displaced.
 _MIN_DTW_SIM: dict[str, float] = {
     "whisperx_official": 0.65,
+    "whisperx_forced":   0.60,   # forced alignment on bad ASR song — need strong DTW to displace
     "whisperx":          0.50,
     "faster-whisper":    0.50,
     "transcriber":       0.50,
@@ -54,6 +56,7 @@ _MIN_DTW_SIM: dict[str, float] = {
 # Minimum DTW avgConfidence to override acoustic.
 _MIN_DTW_CONF: dict[str, float] = {
     "whisperx_official": 0.58,
+    "whisperx_forced":   0.55,
     "whisperx":          0.48,
     "faster-whisper":    0.48,
     "transcriber":       0.48,

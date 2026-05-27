@@ -107,6 +107,7 @@ def compute_confidence(
     # Method penalty
     method_factor = {
         "whisperx_official": 1.00,   # acoustic + correct lyrics text = gold standard
+        "whisperx_forced":   1.00,   # forced CTC alignment against known lyrics
         "whisperx":          1.00,
         "faster-whisper":    0.95,
         "openai-whisper":    0.85,
