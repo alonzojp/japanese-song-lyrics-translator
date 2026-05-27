@@ -24,8 +24,11 @@ except ImportError:
 # ── Regex patterns ─────────────────────────────────────────────────────────────
 
 # Annotations: [Chorus], [Verse 1], （サビ）, 【Bメロ】, etc.
+# Note: 「」 and 『』 are Japanese quotation marks used for speech/titles in
+# lyrics themselves (e.g. 「ここにいるよ、私」) — they must NOT be treated as
+# annotation brackets.
 _ANNOTATION_RE = re.compile(
-    r"[\[【「『（(][^】\]」』）)]*[\]】」』）)]",
+    r"[\[【（(][^】\]）)]*[\]】）)]",
     re.UNICODE,
 )
 

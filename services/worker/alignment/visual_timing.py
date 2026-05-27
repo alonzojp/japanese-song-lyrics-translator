@@ -590,7 +590,9 @@ def visual_timing_normalization(lines: list[dict], job_log=None) -> list[dict]:
                     _cfw_gap  = abs(float(_cfw_s_raw) - float(_plw_e_raw))
                     _plw_ch   = (_plw.get('word') or '').strip()[:1]
                     _cfw_ch   = (_line_words[0].get('word') or '').strip()[:1]
-                    # Conditions: wide hold, abutting start, script crosses kana→Latin
+                    # ── kana→Latin: CTC held kana state, next Latin onset is earlier ──
+                    # e.g. 'う'→'T': actual 'T' onset predates the CTC-marked start.
+                    # Display start is EARLIER than a_start (bypass floor).
                     if (
                         _plw_dur >= _CROSS_HELD_MIN_DUR_S
                         and _cfw_gap <= _CROSS_HELD_GAP_S
@@ -616,6 +618,38 @@ def visual_timing_normalization(lines: list[dict], job_log=None) -> list[dict]:
                                         f"ratio={_plw_dur / _pl_med:.2f} "
                                         f"inferred_onset={_vocal_onset:.3f}s "
                                         f"(bypassing a_start={a_start:.3f}s floor)",
+                                        stage="align",
+                                    )
+
+                    # ── kana→CJK: CTC placed CJK eagerly at segment start, actual onset later ──
+                    # e.g. 'な'→'希': CTC put '希' at prev_last_word.end (= segment start),
+                    # but the actual '希' onset is later: prev_last_word.end + hold_duration.
+                    # Display start is pushed FORWARD (normal a_start floor applies).
+                    elif (
+                        _plw_dur >= _CROSS_HELD_MIN_DUR_S
+                        and _cfw_gap <= _CROSS_HELD_GAP_S
+                        and abs(float(_cfw_s_raw) - a_start) <= _CROSS_HELD_GAP_S
+                        and _is_kana_or_cjk(_plw_ch)
+                        and _is_kana_or_cjk(_cfw_ch)
+                    ):
+                        _pl_durs = sorted([
+                            float(w['end']) - float(w['start'])
+                            for w in _plws[:-1]
+                            if w.get('start') is not None and w.get('end') is not None
+                        ])
+                        if _pl_durs:
+                            _pl_med = _pl_durs[len(_pl_durs) // 2]
+                            if _pl_med > 0 and _plw_dur / _pl_med >= _CROSS_HELD_MIN_RATIO:
+                                _vocal_onset = float(_plw_e_raw) + _plw_dur
+                                _onset_source = 'prev_held_eager_start'
+                                if job_log:
+                                    job_log.info(
+                                        f"[prev_held_eager_start] L{i:02d}: "
+                                        f"prev_last={_plw_ch!r} dur={_plw_dur:.3f}s "
+                                        f"prev_median={_pl_med:.3f}s "
+                                        f"ratio={_plw_dur / _pl_med:.2f} "
+                                        f"inferred_onset={_vocal_onset:.3f}s "
+                                        f"(pushing forward from a_start={a_start:.3f}s)",
                                         stage="align",
                                     )
 
@@ -879,6 +913,56 @@ def visual_timing_normalization(lines: list[dict], job_log=None) -> list[dict]:
             short_floor_end = a_start + moras * _NO_WORDS_SHORT_FLOOR
             if display_end < short_floor_end:
                 display_end = short_floor_end
+
+        # ── Held-note tail extension (kana→CJK cross-line case) ──────────────
+        # When this line's last CTC word was held anomalously long because the
+        # next line's CJK-script first word was eagerly placed at the hold end
+        # (the same pattern that triggers prev_held_eager_start on the next line),
+        # the true vocal completion of this line is last_word.end + hold_duration,
+        # not next_acoustic_start.  Override display_end, bypassing phrase_boundary_cap.
+        if boundary_type == 'CONT' and i + 1 < n and _line_words:
+            _htx_lw   = _line_words[-1]
+            _htx_lw_s = _htx_lw.get('start')
+            _htx_lw_e = _htx_lw.get('end')
+            if _htx_lw_s is not None and _htx_lw_e is not None:
+                _htx_lw_dur = float(_htx_lw_e) - float(_htx_lw_s)
+                _htx_lw_ch  = (_htx_lw.get('word') or '').strip()[:1]
+                if _htx_lw_dur >= _CROSS_HELD_MIN_DUR_S and _is_kana_or_cjk(_htx_lw_ch):
+                    _htx_nxt_words = lines[i + 1].get('words') or []
+                    if _htx_nxt_words:
+                        _htx_nfw   = _htx_nxt_words[0]
+                        _htx_nfw_s = _htx_nfw.get('start')
+                        if _htx_nfw_s is not None:
+                            _htx_nxt_a_start = float(lines[i + 1].get('startTime', 9999.0))
+                            _htx_nch     = (_htx_nfw.get('word') or '').strip()[:1]
+                            _htx_nxt_gap = abs(float(_htx_nfw_s) - float(_htx_lw_e))
+                            _htx_cs_gap  = abs(float(_htx_nfw_s) - _htx_nxt_a_start)
+                            if (
+                                _htx_nxt_gap <= _CROSS_HELD_GAP_S
+                                and _htx_cs_gap <= _CROSS_HELD_GAP_S
+                                and _is_kana_or_cjk(_htx_nch)
+                            ):
+                                _htx_prev_durs = sorted([
+                                    float(w['end']) - float(w['start'])
+                                    for w in _line_words[:-1]
+                                    if w.get('start') is not None and w.get('end') is not None
+                                ])
+                                if _htx_prev_durs:
+                                    _htx_med = _htx_prev_durs[len(_htx_prev_durs) // 2]
+                                    if _htx_med > 0 and _htx_lw_dur / _htx_med >= _CROSS_HELD_MIN_RATIO:
+                                        _htx_tail_end = float(_htx_lw_e) + _htx_lw_dur
+                                        if _htx_tail_end > display_end:
+                                            if job_log:
+                                                job_log.info(
+                                                    f"[held_tail_extend] L{i:02d}: "
+                                                    f"last_word={_htx_lw_ch!r} dur={_htx_lw_dur:.3f}s "
+                                                    f"median={_htx_med:.3f}s "
+                                                    f"ratio={_htx_lw_dur / _htx_med:.2f} "
+                                                    f"extending display_end {display_end:.3f} → {_htx_tail_end:.3f}s "
+                                                    f"(bypasses phrase_boundary_cap={phrase_boundary_cap:.3f}s)",
+                                                    stage="align",
+                                                )
+                                            display_end = _htx_tail_end
 
         saved = a_dur - (display_end - a_start)
         if saved > 0.1:
