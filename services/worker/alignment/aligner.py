@@ -42,11 +42,12 @@ _VOCAL_ENERGY_THRESHOLD   = 0.015  # RMS below this = silence/instrumental (no v
 # When Whisper's deduplication skips a repeated section, text_first leaves a
 # large vocal-energy gap.  These constants control the post-reconstruction pass
 # that detects such gaps and runs a targeted forced alignment to fill them.
-_REPEAT_GAP_THRESH_S = 8.0    # gaps shorter than this are pauses, not repeat zones
-_REPEAT_GAP_MAX_S    = 22.0   # gaps longer than this are instrumentals, not repeats
-_REPEAT_MIN_ENERGY   = 0.025  # RMS below this = no vocal — skip the gap
-_REPEAT_MAX_LOOKBACK = 4      # max official lines to try as repeat candidates
-_REPEAT_MIN_COVERAGE = 0.40   # min word-coverage fraction to accept an alignment
+_REPEAT_GAP_THRESH_S    = 8.0    # gaps shorter than this are pauses, not repeat zones
+_REPEAT_GAP_MAX_S       = 22.0   # gaps longer than this are likely instrumentals, not repeats
+_REPEAT_MIN_ENERGY      = 0.025  # RMS below this = no vocal — skip the gap
+_REPEAT_MAX_LOOKBACK    = 4      # max official lines to try as repeat candidates
+_REPEAT_MIN_COVERAGE    = 0.40   # min word-coverage fraction to accept an alignment
+_REPEAT_MIN_WORD_SCORE  = 0.45   # mean WhisperX word score — rejects force-fit on non-matching audio
 
 # ── Feature flags ─────────────────────────────────────────────────────────────
 # Phase 1: text-informed segment mapping (char bigrams + English anchors + greedy monotone).
@@ -2705,19 +2706,22 @@ def _fill_repeat_gaps(
                 if not gap_words:
                     continue
 
-                first_w  = min(w.get('start', g_end)   for w in gap_words)
-                last_w   = max(w.get('end',   g_start) for w in gap_words)
-                coverage = (last_w - first_w) / max(0.001, g_end - g_start)
+                first_w    = min(w.get('start', g_end)   for w in gap_words)
+                last_w     = max(w.get('end',   g_start) for w in gap_words)
+                coverage   = (last_w - first_w) / max(0.001, g_end - g_start)
+                scores     = [float(w['score']) for w in gap_words if 'score' in w]
+                mean_score = sum(scores) / len(scores) if scores else 1.0
 
                 if job_log:
                     job_log.info(
                         f"[repeat_gap] lookback={lookback} "
                         f"cands={cand_texts[:2]} "
-                        f"words={len(gap_words)} coverage={coverage:.2f}",
+                        f"words={len(gap_words)} coverage={coverage:.2f} "
+                        f"mean_score={mean_score:.3f}",
                         stage="transcribe",
                     )
 
-                if coverage > best_coverage:
+                if coverage > best_coverage and mean_score >= _REPEAT_MIN_WORD_SCORE:
                     best_coverage = coverage
                     w_copy, _ = _apply_vad_anchor(list(gap_words), g_start, -1, None)
                     eff_seg   = {'start': g_start, 'end': g_end,
