@@ -48,6 +48,8 @@ _REPEAT_MIN_ENERGY      = 0.025  # RMS below this = no vocal — skip the gap
 _REPEAT_MAX_LOOKBACK    = 4      # max official lines to try as repeat candidates
 _REPEAT_MIN_COVERAGE    = 0.40   # min word-coverage fraction to accept an alignment
 _REPEAT_MIN_WORD_SCORE  = 0.45   # mean WhisperX word score — rejects force-fit on non-matching audio
+_REPEAT_GAP_LOOKBACK_S  = 3.0   # extend align window this many seconds before g_start to catch
+                                  # repeats that began before the previous line's acoustic end
 
 # ── Feature flags ─────────────────────────────────────────────────────────────
 # Phase 1: text-informed segment mapping (char bigrams + English anchors + greedy monotone).
@@ -2660,9 +2662,10 @@ def _fill_repeat_gaps(
 
     try:
         for g_start, g_end, insert_before in vocal_gaps:
-            prev_line    = sorted_lines[insert_before - 1]
-            prev_off_key = _normalize_for_matching(prev_line.get('text', ''))
-            prev_off_idx = text_to_off.get(prev_off_key, -1)
+            prev_line      = sorted_lines[insert_before - 1]
+            prev_off_key   = _normalize_for_matching(prev_line.get('text', ''))
+            prev_off_idx   = text_to_off.get(prev_off_key, -1)
+            prev_line_start = prev_line.get('start', g_start)
 
             if prev_off_idx < 1:
                 if job_log:
@@ -2673,6 +2676,24 @@ def _fill_repeat_gaps(
                     )
                 continue
 
+            # Extend the alignment window back into the previous line's tail so
+            # that repeats beginning before the previous line's acoustic end are
+            # captured.  _apply_vad_anchor uses g_start as its reference, so it
+            # naturally skips (offset ≤ 0) when words fall before g_start and
+            # applies the normal CTC-lag correction when they fall after it.
+            align_start = max(
+                prev_line_start + 1.0,             # stay clear of the prev-line body
+                g_start - _REPEAT_GAP_LOOKBACK_S,
+            )
+            align_start = min(align_start, g_start)  # never extend forward
+
+            if job_log and align_start < g_start:
+                job_log.info(
+                    f"[repeat_gap] Extended align window "
+                    f"{align_start:.2f}s (←{g_start - align_start:.1f}s lookback)",
+                    stage="transcribe",
+                )
+
             best_lines:    Optional[list[dict]] = None
             best_coverage: float                = 0.0
 
@@ -2682,7 +2703,7 @@ def _fill_repeat_gaps(
                               for j in range(start_idx, prev_off_idx + 1)]
                 gap_seg = {
                     'text':  ' '.join(cand_texts),
-                    'start': g_start,
+                    'start': align_start,   # extended start
                     'end':   g_end,
                 }
                 try:
@@ -2723,8 +2744,11 @@ def _fill_repeat_gaps(
 
                 if coverage > best_coverage and mean_score >= _REPEAT_MIN_WORD_SCORE:
                     best_coverage = coverage
+                    # Anchor uses g_start (not align_start): if words fall before
+                    # g_start the offset is negative and the anchor skips, leaving
+                    # them at the CTC positions found in the extended window.
                     w_copy, _ = _apply_vad_anchor(list(gap_words), g_start, -1, None)
-                    eff_seg   = {'start': g_start, 'end': g_end,
+                    eff_seg   = {'start': align_start, 'end': g_end,
                                  'text': '', 'words': w_copy}
                     best_lines = _split_by_word_gaps(
                         w_copy, cand_texts, eff_seg,
