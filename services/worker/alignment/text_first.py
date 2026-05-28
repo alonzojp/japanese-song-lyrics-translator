@@ -38,9 +38,20 @@ _TAIL_S    = 0.08    # tail after last matched word's end
 _MIN_HANDOFF_COV = 0.50
 
 # ── Safety caps (prevent runaway scans) ───────────────────────────────────────
-_MAX_CONSEC_SKIP = 8     # consecutive non-matching words before soft break
+# 15 × 3 = 45 consecutive misses.  Raised from 8 (24) so the scanner can skip
+# over a full sung repetition of 1-2 lines (~30 tokens) to reach the next
+# unique lyric line when official lyrics list a repeated section only once.
+_MAX_CONSEC_SKIP = 15    # consecutive non-matching words before soft break
 _MAX_SCAN        = 80    # total words examined per line (hard upper bound)
 _SEARCH_WINDOW   = 40    # lyric-char look-ahead for near-match detection
+
+# ── Repeat-gap detection ────────────────────────────────────────────────────────
+# Official lyrics often omit repeated sections (e.g. chorus sung twice but
+# written once).  After the main pass, gaps this wide that contain enough words
+# trigger a second attempt to fill them with matching official lines.
+_REPEAT_GAP_S   = 4.0   # seconds — gaps narrower than this are pauses, not repeats
+_REPEAT_MIN_W   = 4     # minimum words in gap to attempt matching
+_REPEAT_MIN_COV = 0.40  # minimum coverage to accept a gap match
 
 # ── Minimum match coverage to produce a timed result (not a fallback) ─────────
 _MIN_RESULT_COV  = 0.40
@@ -330,4 +341,108 @@ def reconstruct_lines_text_first(
         f'[text_first] Done: {len(result)} lines, '
         f'{ptr}/{n_words} words consumed ({100 * ptr // max(1, n_words)}%)'
     )
+
+    # ── Repeat-gap fill: recover lines sung twice but listed once ──────────────
+    # The main pass skips over repeated audio words when official lyrics only
+    # show them once.  Those skipped words land in gaps between result lines.
+    # For each gap wider than _REPEAT_GAP_S that contains enough words, try to
+    # match official lines against those gap words and insert the repeats.
+    if words and result:
+        result_by_time = sorted(result, key=lambda r: r['start'])
+        all_start = float(words[0].get('start', 0))
+        all_end   = float(words[-1].get('end') or words[-1].get('start') or 0)
+
+        def _gap_words(t0: float, t1: float) -> list[dict]:
+            return [
+                w for w in words
+                if float(w.get('start', 0)) >= t0 + 0.05
+                and float(w.get('start', 0)) <  t1 - 0.05
+            ]
+
+        candidate_gaps: list[list[dict]] = []
+
+        # Gap before the first matched line
+        if result_by_time[0]['start'] - all_start >= _REPEAT_GAP_S:
+            gw = _gap_words(all_start, result_by_time[0]['start'])
+            if len(gw) >= _REPEAT_MIN_W:
+                candidate_gaps.append(gw)
+
+        # Gaps between consecutive result lines
+        for i in range(len(result_by_time) - 1):
+            g_s = result_by_time[i]['end']
+            g_e = result_by_time[i + 1]['start']
+            if g_e - g_s >= _REPEAT_GAP_S:
+                gw = _gap_words(g_s, g_e)
+                if len(gw) >= _REPEAT_MIN_W:
+                    candidate_gaps.append(gw)
+
+        # Gap after the last matched line
+        if all_end - result_by_time[-1]['end'] >= _REPEAT_GAP_S:
+            gw = _gap_words(result_by_time[-1]['end'], all_end)
+            if len(gw) >= _REPEAT_MIN_W:
+                candidate_gaps.append(gw)
+
+        repeat_added = 0
+        for gap_wds in candidate_gaps:
+            gap_ptr = 0
+            added: list[dict] = []
+
+            for li, line in enumerate(official_lines):
+                text = line.get('text', '').strip()
+                if not text:
+                    continue
+
+                lyric_norm_r = norms[li]
+                next_norm_r  = ''
+                for j in range(li + 1, len(official_lines)):
+                    if norms[j]:
+                        next_norm_r = norms[j]
+                        break
+
+                matched_r, new_gap_ptr, cov_r = _match_line(
+                    lyric_norm_r, next_norm_r, gap_wds, gap_ptr
+                )
+
+                if matched_r and cov_r >= _REPEAT_MIN_COV:
+                    ws = float(matched_r[0].get('start') or 0)
+                    we = float(matched_r[-1].get('end') or matched_r[-1].get('start') or ws)
+                    rs = max(0.0, round(ws - _PRELOAD_S, 3))
+                    re = round(we + _TAIL_S, 3)
+
+                    # Skip if same text at essentially the same timestamp already exists
+                    is_dup = any(
+                        abs(ex['start'] - rs) < 1.0 and ex.get('text') == text
+                        for ex in result
+                    )
+                    if not is_dup:
+                        added.append({
+                            'text':  text,
+                            'start': rs,
+                            'end':   re,
+                            'words': [
+                                {
+                                    'word':  w.get('word', ''),
+                                    'start': round(float(w.get('start') or 0), 3),
+                                    'end':   round(float(w.get('end') or w.get('start') or 0), 3),
+                                    'score': w.get('score', 1.0),
+                                }
+                                for w in matched_r
+                            ],
+                            '_timing_source': 'text_first_repeat',
+                        })
+                    gap_ptr = new_gap_ptr
+
+            if added:
+                _log(
+                    f'[text_first] Repeat gap fill: +{len(added)} lines at '
+                    f'{gap_wds[0].get("start", 0):.1f}–'
+                    f'{gap_wds[-1].get("end", gap_wds[-1].get("start", 0)):.1f}s'
+                )
+                result.extend(added)
+                repeat_added += len(added)
+
+        if repeat_added:
+            result.sort(key=lambda r: r['start'])
+            _log(f'[text_first] Total repeat lines inserted: {repeat_added}')
+
     return result
