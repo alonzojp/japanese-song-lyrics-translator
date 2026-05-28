@@ -38,6 +38,15 @@ _MAX_LINE_EXTENSION_MS    = 1200   # hard cap: never extend a line more than thi
 _INSTRUMENTAL_TAIL_MS     = 1800   # gaps beyond this are classified as instrumental tails
 _VOCAL_ENERGY_THRESHOLD   = 0.015  # RMS below this = silence/instrumental (no vocal)
 
+# ── Repeat-gap fill ───────────────────────────────────────────────────────────
+# When Whisper's deduplication skips a repeated section, text_first leaves a
+# large vocal-energy gap.  These constants control the post-reconstruction pass
+# that detects such gaps and runs a targeted forced alignment to fill them.
+_REPEAT_GAP_THRESH_S = 8.0    # gaps shorter than this are pauses, not repeat zones
+_REPEAT_MIN_ENERGY   = 0.025  # RMS below this = no vocal — skip the gap
+_REPEAT_MAX_LOOKBACK = 4      # max official lines to try as repeat candidates
+_REPEAT_MIN_COVERAGE = 0.40   # min word-coverage fraction to accept an alignment
+
 # ── Feature flags ─────────────────────────────────────────────────────────────
 # Phase 1: text-informed segment mapping (char bigrams + English anchors + greedy monotone).
 # Set False to revert to duration-only assignment.
@@ -1895,6 +1904,11 @@ def _align_whisperx_with_official_lyrics(
                         f"with {len(reconstructed)} text-first lines",
                         stage="transcribe",
                     )
+                # Fill vocal-energy gaps left by Whisper's deduplication skipping
+                # repeated sections (e.g. chorus sung twice but listed once in lyrics).
+                reconstructed = _fill_repeat_gaps(
+                    reconstructed, official_lines, audio_path, job_log
+                )
                 return reconstructed, "whisperx_official"
     except Exception as _tf_exc:
         if job_log:
@@ -2551,6 +2565,188 @@ def _audit_boundaries(lines: list[dict], job_log) -> None:
         f"[AUDIT] ══════ end audit ══════",
         stage="align",
     )
+
+
+# ── Repeat-gap fill ──────────────────────────────────────────────────────────
+
+def _fill_repeat_gaps(
+    lines:          list[dict],
+    official_lines: list[dict],
+    audio_path:     Path,
+    job_log,
+) -> list[dict]:
+    """
+    Detect large vocal-energy gaps in text_first output and fill them by running
+    a targeted WhisperX forced alignment with the official lines just before each
+    gap as candidate repeat text.
+
+    Handles the case where Whisper's built-in deduplication skips a repeated
+    chorus section entirely, leaving zero words for that time window.
+
+    Safe for songs without repetition: the vocal energy check prevents false
+    triggers on instrumental sections, and the coverage threshold rejects
+    alignments that don't actually match the audio.
+    """
+    if len(lines) < 2 or not official_lines:
+        return lines
+
+    sorted_lines = sorted(lines, key=lambda l: l.get('start', 0.0))
+
+    # Use the Demucs-separated vocal track for energy probing when available
+    asr_path   = audio_path.parent / 'vocals_asr.wav'
+    probe_path = asr_path if asr_path.exists() else audio_path
+
+    # Build normalised-text → official_index lookup (first occurrence wins)
+    text_to_off: dict[str, int] = {}
+    for idx, ln in enumerate(official_lines):
+        key = _normalize_for_matching(ln.get('text', ''))
+        if key not in text_to_off:
+            text_to_off[key] = idx
+
+    # Identify gaps with vocal energy
+    vocal_gaps: list[tuple[float, float, int]] = []  # (gap_start, gap_end, insert_before)
+    for i in range(1, len(sorted_lines)):
+        g_start = sorted_lines[i - 1].get('end', 0.0)
+        g_end   = sorted_lines[i].get('start', 0.0)
+        if g_end - g_start < _REPEAT_GAP_THRESH_S:
+            continue
+        energy = _vocal_energy_in_window(probe_path, g_start, g_end)
+        if energy < _REPEAT_MIN_ENERGY:
+            if job_log:
+                job_log.info(
+                    f"[repeat_gap] Instrumental gap {g_start:.1f}–{g_end:.1f}s "
+                    f"({g_end - g_start:.1f}s, energy={energy:.4f}) — skip",
+                    stage="transcribe",
+                )
+            continue
+        if job_log:
+            job_log.info(
+                f"[repeat_gap] Vocal-energy gap {g_start:.1f}–{g_end:.1f}s "
+                f"({g_end - g_start:.1f}s, energy={energy:.4f}) — attempting fill",
+                stage="transcribe",
+            )
+        vocal_gaps.append((g_start, g_end, i))
+
+    if not vocal_gaps:
+        return sorted_lines
+
+    # Load WhisperX align model once for all gaps
+    try:
+        import whisperx as _wx
+        _device     = _get_device()
+        _audio_data = _wx.load_audio(str(audio_path))
+        _amodel, _ameta = _wx.load_align_model(
+            language_code=WHISPER_LANGUAGE, device=_device,
+        )
+    except Exception as exc:
+        if job_log:
+            job_log.warning(
+                f"[repeat_gap] Cannot load WhisperX for gap fill: {exc}",
+                stage="transcribe",
+            )
+        return sorted_lines
+
+    insertions: list[tuple[int, list[dict]]] = []
+
+    try:
+        for g_start, g_end, insert_before in vocal_gaps:
+            prev_line    = sorted_lines[insert_before - 1]
+            prev_off_key = _normalize_for_matching(prev_line.get('text', ''))
+            prev_off_idx = text_to_off.get(prev_off_key, -1)
+
+            if prev_off_idx < 1:
+                if job_log:
+                    job_log.info(
+                        f"[repeat_gap] Gap at {g_start:.1f}s: "
+                        f"cannot map prev line to official lyrics — skip",
+                        stage="transcribe",
+                    )
+                continue
+
+            best_lines:    Optional[list[dict]] = None
+            best_coverage: float                = 0.0
+
+            for lookback in range(2, min(_REPEAT_MAX_LOOKBACK + 1, prev_off_idx + 2)):
+                start_idx  = max(0, prev_off_idx - lookback + 1)
+                cand_texts = [official_lines[j]['text']
+                              for j in range(start_idx, prev_off_idx + 1)]
+                gap_seg = {
+                    'text':  ' '.join(cand_texts),
+                    'start': g_start,
+                    'end':   g_end,
+                }
+                try:
+                    result_aligned = _wx.align(
+                        [gap_seg], _amodel, _ameta, _audio_data, _device,
+                        return_char_alignments=False,
+                    )
+                    gap_words: list[dict] = []
+                    for _aseg in result_aligned.get('segments', []):
+                        gap_words.extend(_aseg.get('words', []))
+                    gap_words.sort(key=lambda w: float(w.get('start', 0)))
+                except Exception as exc:
+                    if job_log:
+                        job_log.warning(
+                            f"[repeat_gap] WhisperX align (lookback={lookback}) "
+                            f"at {g_start:.1f}s failed: {exc}",
+                            stage="transcribe",
+                        )
+                    continue
+
+                if not gap_words:
+                    continue
+
+                first_w  = min(w.get('start', g_end)   for w in gap_words)
+                last_w   = max(w.get('end',   g_start) for w in gap_words)
+                coverage = (last_w - first_w) / max(0.001, g_end - g_start)
+
+                if job_log:
+                    job_log.info(
+                        f"[repeat_gap] lookback={lookback} "
+                        f"cands={cand_texts[:2]} "
+                        f"words={len(gap_words)} coverage={coverage:.2f}",
+                        stage="transcribe",
+                    )
+
+                if coverage > best_coverage:
+                    best_coverage = coverage
+                    w_copy, _ = _apply_vad_anchor(list(gap_words), g_start, -1, None)
+                    eff_seg   = {'start': g_start, 'end': g_end,
+                                 'text': '', 'words': w_copy}
+                    best_lines = _split_by_word_gaps(
+                        w_copy, cand_texts, eff_seg,
+                        job_log=job_log, seg_id=-1,
+                    )
+
+            if best_lines and best_coverage >= _REPEAT_MIN_COVERAGE:
+                for ln in best_lines:
+                    ln['_timing_source'] = 'repeat_fill'
+                if job_log:
+                    job_log.info(
+                        f"[repeat_gap] Inserting {len(best_lines)} repeat lines "
+                        f"at {g_start:.1f}–{g_end:.1f}s (coverage={best_coverage:.2f})",
+                        stage="transcribe",
+                    )
+                insertions.append((insert_before, best_lines))
+            else:
+                if job_log:
+                    job_log.info(
+                        f"[repeat_gap] Gap {g_start:.1f}–{g_end:.1f}s: "
+                        f"best_coverage={best_coverage:.2f} < {_REPEAT_MIN_COVERAGE} "
+                        f"— not inserted",
+                        stage="transcribe",
+                    )
+    finally:
+        del _amodel
+        _free_vram()
+
+    if not insertions:
+        return sorted_lines
+
+    result = list(sorted_lines)
+    for insert_before, new_lines in reversed(insertions):
+        result = result[:insert_before] + new_lines + result[insert_before:]
+    return sorted(result, key=lambda l: l.get('start', 0.0))
 
 
 # ── Public entry point ─────────────────────────────────────────────────────────
