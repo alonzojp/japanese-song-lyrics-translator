@@ -1208,6 +1208,18 @@ def finalize_timeline(lines: list[dict], job_log=None) -> list[dict]:
                         )
                     line['endTime'] = capped
                     n_capped += 1
+                    # When the minimum-duration floor prevents a clean cap, the
+                    # next line's start still sits inside this line's window.
+                    # Push it forward so the timeline remains non-overlapping.
+                    if capped > float(lines[i + 1].get('startTime', capped)):
+                        lines[i + 1]['startTime'] = round(capped, 3)
+                        n_pushed += 1
+                        if job_log:
+                            job_log.info(
+                                f"[finalize] L{i:02d}→L{i+1:02d}: cascade push start "
+                                f"{next_start:.3f} → {capped:.3f}s (min-floor prevented cap)",
+                                stage="align",
+                            )
 
     # Final monotonicity check (diagnostic only — never silently corrupt)
     n_nonmono = 0

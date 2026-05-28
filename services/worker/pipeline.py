@@ -179,6 +179,10 @@ def _write_canonical(job_cache: Path, jl) -> None:
         jl.warning(f"[repeat_gap] Canonical gap fill failed (non-fatal): {_rg_exc}",
                    stage="align")
 
+    # Final timeline pass guarantees no overlaps survive into canonical_lines.json —
+    # covers both DTW cascade failures and any gaps introduced by repeat fill.
+    finalize_timeline(lines, job_log=jl)
+
     save_canonical_lines(job_cache, lines, source, meta)
     jl.info(f"[canonical] Wrote {len(lines)} lines → canonical_lines.json", stage="align")
     for i, ln in enumerate(lines):
