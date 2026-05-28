@@ -2717,6 +2717,12 @@ def _fill_repeat_gaps(
                         w_copy, cand_texts, eff_seg,
                         job_log=job_log, seg_id=-1,
                     )
+                    # Accept the FIRST lookback that clears the threshold rather
+                    # than maximising greedily — longer candidate lists always
+                    # produce equal-or-higher pseudo-coverage even when the extra
+                    # lines don't actually match the audio.
+                    if coverage >= _REPEAT_MIN_COVERAGE:
+                        break
 
             if best_lines and best_coverage >= _REPEAT_MIN_COVERAGE:
                 for ln in best_lines:
@@ -2747,6 +2753,50 @@ def _fill_repeat_gaps(
     for insert_before, new_lines in reversed(insertions):
         result = result[:insert_before] + new_lines + result[insert_before:]
     return sorted(result, key=lambda l: l.get('start', 0.0))
+
+
+def fill_canonical_repeat_gaps(
+    lines:          list[dict],   # LyricLine format: startTime/endTime
+    official_lines: list[dict],
+    audio_path:     Path,
+    job_log,
+) -> list[dict]:
+    """
+    Public wrapper: apply _fill_repeat_gaps to canonical-format (startTime/endTime)
+    lines, converting to/from the internal start/end format used by the aligner.
+    Returns the line list with any repeated-section lines inserted.
+    """
+    if not lines or not official_lines:
+        return lines
+
+    # Add internal start/end aliases so _fill_repeat_gaps can read them
+    internal = [
+        {**ln, 'start': ln.get('startTime', 0.0), 'end': ln.get('endTime', 0.0)}
+        for ln in lines
+    ]
+
+    filled = _fill_repeat_gaps(internal, official_lines, audio_path, job_log)
+
+    if len(filled) == len(internal):
+        return lines  # no insertions — return original unchanged
+
+    result: list[dict] = []
+    for ln in filled:
+        if ln.get('_timing_source') == 'repeat_fill':
+            # New gap-fill line — convert to canonical LyricLine format
+            new_ln: dict = {
+                'id':        f"line-rpt-{len(result)}",
+                'text':      ln.get('text', ''),
+                'startTime': round(ln.get('start', 0.0), 3),
+                'endTime':   round(ln.get('end',   0.0), 3),
+                'words':     ln.get('words', []),
+            }
+            result.append(new_ln)
+        else:
+            # Original line — strip internal-only aliases
+            result.append({k: v for k, v in ln.items() if k not in ('start', 'end')})
+
+    return sorted(result, key=lambda l: l.get('startTime', 0.0))
 
 
 # ── Public entry point ─────────────────────────────────────────────────────────

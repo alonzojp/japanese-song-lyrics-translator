@@ -161,6 +161,24 @@ def _write_canonical(job_cache: Path, jl) -> None:
             stage="align",
         )
 
+    # ── Repeat-gap fill (applies regardless of acoustic vs DTW selection) ────
+    # Detects vocal-energy gaps Whisper skipped due to deduplication and runs a
+    # targeted WhisperX forced-alignment pass to fill them.  No-op on songs
+    # without repeated sections (energy check + coverage gate prevent false hits).
+    try:
+        from alignment.aligner import fill_canonical_repeat_gaps
+        _yt_id = job_cache.name
+        _lyrics = get_cached_lyrics(_yt_id)
+        _official = _lyrics.get("lines", []) if _lyrics else []
+        if _official:
+            _asr   = job_cache / "vocals_asr.wav"
+            _audio = _asr if _asr.exists() else job_cache / "audio.wav"
+            if _audio.exists():
+                lines = fill_canonical_repeat_gaps(lines, _official, _audio, jl)
+    except Exception as _rg_exc:
+        jl.warning(f"[repeat_gap] Canonical gap fill failed (non-fatal): {_rg_exc}",
+                   stage="align")
+
     save_canonical_lines(job_cache, lines, source, meta)
     jl.info(f"[canonical] Wrote {len(lines)} lines → canonical_lines.json", stage="align")
     for i, ln in enumerate(lines):
