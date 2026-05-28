@@ -50,8 +50,8 @@ _SEARCH_WINDOW   = 40    # lyric-char look-ahead for near-match detection
 # written once).  After the main pass, gaps this wide that contain enough words
 # trigger a second attempt to fill them with matching official lines.
 _REPEAT_GAP_S   = 4.0   # seconds — gaps narrower than this are pauses, not repeats
-_REPEAT_MIN_W   = 4     # minimum words in gap to attempt matching
-_REPEAT_MIN_COV = 0.40  # minimum coverage to accept a gap match
+_REPEAT_MIN_W   = 6     # minimum words in gap to attempt matching (filters hallucinations)
+_REPEAT_MIN_COV = 0.50  # minimum coverage to accept a gap match
 
 # ── Minimum match coverage to produce a timed result (not a fallback) ─────────
 _MIN_RESULT_COV  = 0.40
