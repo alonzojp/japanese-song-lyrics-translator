@@ -43,6 +43,7 @@ _VOCAL_ENERGY_THRESHOLD   = 0.015  # RMS below this = silence/instrumental (no v
 # large vocal-energy gap.  These constants control the post-reconstruction pass
 # that detects such gaps and runs a targeted forced alignment to fill them.
 _REPEAT_GAP_THRESH_S = 8.0    # gaps shorter than this are pauses, not repeat zones
+_REPEAT_GAP_MAX_S    = 22.0   # gaps longer than this are instrumentals, not repeats
 _REPEAT_MIN_ENERGY   = 0.025  # RMS below this = no vocal — skip the gap
 _REPEAT_MAX_LOOKBACK = 4      # max official lines to try as repeat candidates
 _REPEAT_MIN_COVERAGE = 0.40   # min word-coverage fraction to accept an alignment
@@ -2609,6 +2610,14 @@ def _fill_repeat_gaps(
         g_start = sorted_lines[i - 1].get('end', 0.0)
         g_end   = sorted_lines[i].get('start', 0.0)
         if g_end - g_start < _REPEAT_GAP_THRESH_S:
+            continue
+        if g_end - g_start > _REPEAT_GAP_MAX_S:
+            if job_log:
+                job_log.info(
+                    f"[repeat_gap] Gap {g_start:.1f}–{g_end:.1f}s "
+                    f"({g_end - g_start:.1f}s) exceeds max {_REPEAT_GAP_MAX_S}s — skip",
+                    stage="transcribe",
+                )
             continue
         energy = _vocal_energy_in_window(probe_path, g_start, g_end)
         if energy < _REPEAT_MIN_ENERGY:
