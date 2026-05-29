@@ -51,6 +51,16 @@ _REPEAT_MIN_WORD_SCORE  = 0.45   # mean WhisperX word score — rejects force-fi
 _REPEAT_GAP_LOOKBACK_S  = 3.0   # extend align window this many seconds before g_start to catch
                                   # repeats that began before the previous line's acoustic end
 
+# ── Compressed-repeat fix ─────────────────────────────────────────────────────
+# Whisper deduplication can collapse a repeated chorus into one segment: the first
+# line of the repeat gets CTC timing at the segment head, subsequent lines get
+# compressed, and the last line stretches to fill the segment tail.  These
+# constants gate the detection and re-alignment pass that fixes such blocks.
+_CREP_STRETCH_MAX     = 2.00   # last block-line flagged when > this × max(other durs)
+_CREP_SHORT_ABS_S     = 2.00   # non-last block-line flagged when duration below this
+_CREP_BLOCK_MIN_LINES = 2      # minimum consecutive repeat lines to trigger
+_CREP_WINDOW_MAX_S    = 45.0   # skip when distance to next anchor exceeds this
+
 # ── Feature flags ─────────────────────────────────────────────────────────────
 # Phase 1: text-informed segment mapping (char bigrams + English anchors + greedy monotone).
 # Set False to revert to duration-only assignment.
@@ -1913,6 +1923,11 @@ def _align_whisperx_with_official_lyrics(
                 reconstructed = _fill_repeat_gaps(
                     reconstructed, official_lines, audio_path, job_log
                 )
+                # Fix blocks where repeat lines were compressed into the segment head
+                # with the last line absorbing the remaining time (CTC dedup artefact).
+                reconstructed = _fix_compressed_repeats(
+                    reconstructed, official_lines, audio_path, job_log
+                )
                 return reconstructed, "whisperx_official"
     except Exception as _tf_exc:
         if job_log:
@@ -2831,6 +2846,248 @@ def fill_canonical_repeat_gaps(
             result.append(new_ln)
         else:
             # Original line — strip internal-only aliases
+            result.append({k: v for k, v in ln.items() if k not in ('start', 'end')})
+
+    return sorted(result, key=lambda l: l.get('startTime', 0.0))
+
+
+# ── Compressed-repeat fix ────────────────────────────────────────────────────
+
+def _fix_compressed_repeats(
+    lines:          list[dict],
+    official_lines: list[dict],
+    audio_path:     Path,
+    job_log,
+) -> list[dict]:
+    """
+    Fix blocks of repeated lyric lines whose internal timing was collapsed by
+    Whisper's deduplication: CTC alignment placed early repeat lines at the
+    segment head with the last line stretching to fill the remainder.
+
+    Detection — a contiguous group of "timeline repeats" (every line's normalized
+    text appears earlier in the sorted timeline) is flagged when:
+      1. block has ≥ _CREP_BLOCK_MIN_LINES lines
+      2. at least one non-last line has duration < _CREP_SHORT_ABS_S
+      3. last line duration > _CREP_STRETCH_MAX × max(other block-line durations)
+      4. no line in the block was already fixed by _fill_repeat_gaps
+
+    Fix — forced alignment of the block's texts in the window
+    [block_start, next_anchor_start]; accepted only when coverage ≥
+    _REPEAT_MIN_COVERAGE and mean word score ≥ _REPEAT_MIN_WORD_SCORE.
+    All other lines are untouched.
+    """
+    if len(lines) < _CREP_BLOCK_MIN_LINES + 1 or not official_lines:
+        return lines
+
+    sorted_lines = sorted(lines, key=lambda l: l.get('start', 0.0))
+
+    # Mark each line as a timeline repeat (same normalized text seen earlier)
+    seen_texts: set[str] = set()
+    is_repeat: list[bool] = []
+    for ln in sorted_lines:
+        norm = _normalize_for_matching(ln.get('text', ''))
+        is_repeat.append(norm in seen_texts)
+        seen_texts.add(norm)
+
+    # Find maximal contiguous groups of timeline repeats
+    suspect_blocks: list[tuple[int, int]] = []
+    i = 0
+    n = len(sorted_lines)
+    while i < n:
+        if not is_repeat[i]:
+            i += 1
+            continue
+        j = i
+        while j < n and is_repeat[j]:
+            j += 1
+        bi, bj = i, j - 1
+        if bj - bi + 1 >= _CREP_BLOCK_MIN_LINES:
+            block = sorted_lines[bi:bj + 1]
+            if any(l.get('_timing_source') == 'repeat_fill' for l in block):
+                i = j
+                continue
+            durs          = [l.get('end', 0.0) - l.get('start', 0.0) for l in block]
+            non_last_durs = durs[:-1]
+            last_dur      = durs[-1]
+            max_other     = max(non_last_durs)
+            has_short     = any(d < _CREP_SHORT_ABS_S for d in non_last_durs)
+            is_stretch    = last_dur > _CREP_STRETCH_MAX * max_other
+            if has_short and is_stretch:
+                suspect_blocks.append((bi, bj))
+                if job_log:
+                    job_log.info(
+                        f"[crep] Suspect block [{bi}–{bj}]: "
+                        f"durs={[round(d, 2) for d in durs]}s  "
+                        f"last/max_other={last_dur / max_other:.1f}×",
+                        stage="transcribe",
+                    )
+        i = j
+
+    if not suspect_blocks:
+        return sorted_lines
+
+    try:
+        import whisperx as _wx
+        _device     = _get_device()
+        _audio_data = _wx.load_audio(str(audio_path))
+        _amodel, _ameta = _wx.load_align_model(
+            language_code=WHISPER_LANGUAGE, device=_device,
+        )
+    except Exception as exc:
+        if job_log:
+            job_log.warning(f"[crep] WhisperX unavailable: {exc}", stage="transcribe")
+        return sorted_lines
+
+    result       = list(sorted_lines)
+    idx_offset   = 0
+
+    try:
+        for bi, bj in suspect_blocks:
+            ri    = bi + idx_offset
+            rj    = bj + idx_offset
+            block = result[ri:rj + 1]
+
+            win_start = block[0].get('start', 0.0)
+            win_end   = result[rj + 1].get('start') if rj + 1 < len(result) else None
+
+            if win_end is None:
+                if job_log:
+                    job_log.info(
+                        f"[crep] Block [{bi}–{bj}]: no post-block anchor — skip",
+                        stage="transcribe",
+                    )
+                continue
+
+            if win_end - win_start > _CREP_WINDOW_MAX_S:
+                if job_log:
+                    job_log.info(
+                        f"[crep] Block [{bi}–{bj}]: window {win_end - win_start:.1f}s "
+                        f"> {_CREP_WINDOW_MAX_S}s — skip",
+                        stage="transcribe",
+                    )
+                continue
+
+            cand_texts = [l.get('text', '') for l in block]
+            gap_seg    = {'text': ' '.join(cand_texts), 'start': win_start, 'end': win_end}
+
+            try:
+                aligned = _wx.align(
+                    [gap_seg], _amodel, _ameta, _audio_data, _device,
+                    return_char_alignments=False,
+                )
+                gap_words: list[dict] = []
+                for aseg in aligned.get('segments', []):
+                    gap_words.extend(aseg.get('words', []))
+                gap_words.sort(key=lambda w: float(w.get('start', 0)))
+            except Exception as exc:
+                if job_log:
+                    job_log.warning(
+                        f"[crep] align failed for block [{bi}–{bj}]: {exc}",
+                        stage="transcribe",
+                    )
+                continue
+
+            if not gap_words:
+                if job_log:
+                    job_log.info(
+                        f"[crep] Block [{bi}–{bj}]: no words returned — skip",
+                        stage="transcribe",
+                    )
+                continue
+
+            first_w    = min(w.get('start', win_end)   for w in gap_words)
+            last_w     = max(w.get('end',   win_start) for w in gap_words)
+            coverage   = (last_w - first_w) / max(0.001, win_end - win_start)
+            scores     = [float(w['score']) for w in gap_words if 'score' in w]
+            mean_score = sum(scores) / len(scores) if scores else 0.0
+
+            if job_log:
+                job_log.info(
+                    f"[crep] Block [{bi}–{bj}]: realigned {first_w:.2f}–{last_w:.2f}s "
+                    f"coverage={coverage:.2f} mean_score={mean_score:.3f}",
+                    stage="transcribe",
+                )
+
+            if coverage < _REPEAT_MIN_COVERAGE or mean_score < _REPEAT_MIN_WORD_SCORE:
+                if job_log:
+                    job_log.info(
+                        f"[crep] Block [{bi}–{bj}]: rejected "
+                        f"(coverage={coverage:.2f} mean_score={mean_score:.3f})",
+                        stage="transcribe",
+                    )
+                continue
+
+            eff_seg   = {'start': win_start, 'end': win_end, 'text': '', 'words': gap_words}
+            new_lines = _split_by_word_gaps(
+                gap_words, cand_texts, eff_seg, job_log=job_log, seg_id=-2,
+            )
+
+            if not new_lines:
+                continue
+
+            _tol = 2.0
+            if not all(
+                win_start - _tol <= l.get('start', 0.0) <= win_end + _tol
+                for l in new_lines
+            ):
+                if job_log:
+                    job_log.warning(
+                        f"[crep] Block [{bi}–{bj}]: new lines outside window — skip",
+                        stage="transcribe",
+                    )
+                continue
+
+            for nl in new_lines:
+                nl['_timing_source'] = 'crep_fix'
+
+            if job_log:
+                job_log.info(
+                    f"[crep] Block [{bi}–{bj}]: replaced → "
+                    f"{[(round(l['start'], 2), round(l['end'], 2)) for l in new_lines]}",
+                    stage="transcribe",
+                )
+
+            result     = result[:ri] + new_lines + result[rj + 1:]
+            idx_offset += len(new_lines) - (rj - ri + 1)
+    finally:
+        del _amodel
+        _free_vram()
+
+    return sorted(result, key=lambda l: l.get('start', 0.0))
+
+
+def fix_canonical_compressed_repeats(
+    lines:          list[dict],
+    official_lines: list[dict],
+    audio_path:     Path,
+    job_log,
+) -> list[dict]:
+    """
+    Public wrapper: apply _fix_compressed_repeats to canonical-format
+    (startTime/endTime) lines, converting aliases in both directions.
+    Returns the line list with corrected repeated-section timings.
+    """
+    if not lines or not official_lines:
+        return lines
+
+    internal = [
+        {**ln, 'start': ln.get('startTime', 0.0), 'end': ln.get('endTime', 0.0)}
+        for ln in lines
+    ]
+
+    fixed = _fix_compressed_repeats(internal, official_lines, audio_path, job_log)
+
+    result: list[dict] = []
+    for ln in fixed:
+        if ln.get('_timing_source') == 'crep_fix':
+            result.append({
+                'id':        f"line-crep-{len(result)}",
+                'text':      ln.get('text', ''),
+                'startTime': round(ln.get('start', 0.0), 3),
+                'endTime':   round(ln.get('end',   0.0), 3),
+                'words':     ln.get('words', []),
+            })
+        else:
             result.append({k: v for k, v in ln.items() if k not in ('start', 'end')})
 
     return sorted(result, key=lambda l: l.get('startTime', 0.0))

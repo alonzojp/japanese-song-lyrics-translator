@@ -166,7 +166,7 @@ def _write_canonical(job_cache: Path, jl) -> None:
     # targeted WhisperX forced-alignment pass to fill them.  No-op on songs
     # without repeated sections (energy check + coverage gate prevent false hits).
     try:
-        from alignment.aligner import fill_canonical_repeat_gaps
+        from alignment.aligner import fill_canonical_repeat_gaps, fix_canonical_compressed_repeats
         _yt_id = job_cache.name
         _lyrics = get_cached_lyrics(_yt_id)
         _official = _lyrics.get("lines", []) if _lyrics else []
@@ -175,6 +175,7 @@ def _write_canonical(job_cache: Path, jl) -> None:
             _audio = _asr if _asr.exists() else job_cache / "audio.wav"
             if _audio.exists():
                 lines = fill_canonical_repeat_gaps(lines, _official, _audio, jl)
+                lines = fix_canonical_compressed_repeats(lines, _official, _audio, jl)
     except Exception as _rg_exc:
         jl.warning(f"[repeat_gap] Canonical gap fill failed (non-fatal): {_rg_exc}",
                    stage="align")
