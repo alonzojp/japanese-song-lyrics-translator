@@ -56,10 +56,11 @@ _REPEAT_GAP_LOOKBACK_S  = 3.0   # extend align window this many seconds before g
 # line of the repeat gets CTC timing at the segment head, subsequent lines get
 # compressed, and the last line stretches to fill the segment tail.  These
 # constants gate the detection and re-alignment pass that fixes such blocks.
-_CREP_STRETCH_MAX     = 2.00   # last block-line flagged when > this × max(other durs)
-_CREP_SHORT_ABS_S     = 2.00   # non-last block-line flagged when duration below this
-_CREP_BLOCK_MIN_LINES = 2      # minimum consecutive repeat lines to trigger
-_CREP_WINDOW_MAX_S    = 45.0   # skip when distance to next anchor exceeds this
+_CREP_STRETCH_MAX        = 2.00   # last block-line flagged when > this × max(other durs)
+_CREP_SHORT_ABS_S        = 2.00   # non-last block-line flagged when duration below this
+_CREP_BLOCK_MIN_LINES    = 2      # minimum consecutive repeat lines to trigger
+_CREP_WINDOW_MAX_S       = 45.0   # skip when distance to next anchor exceeds this
+_CREP_MAX_LINE_WINDOW_S  = 10.0   # per-line window cap (keeps each CTC call to one occurrence)
 
 # ── Feature flags ─────────────────────────────────────────────────────────────
 # Phase 1: text-informed segment mapping (char bigrams + English anchors + greedy monotone).
@@ -2993,67 +2994,108 @@ def _fix_compressed_repeats(
                 continue
 
             cand_texts = [l.get('text', '') for l in block]
-            gap_seg    = {'text': ' '.join(cand_texts), 'start': win_start, 'end': win_end}
 
-            try:
-                aligned = _wx.align(
-                    [gap_seg], _amodel, _ameta, _audio_data, _device,
-                    return_char_alignments=False,
+            # Align each line SEPARATELY in a bounded window so CTC can never
+            # see the same text twice in one call and dedup it again.
+            new_lines: list[dict] = []
+            cursor          = win_start
+            align_aborted   = False
+
+            for ci, cand_text in enumerate(cand_texts):
+                is_last     = (ci == len(cand_texts) - 1)
+                line_win_end = (
+                    win_end if is_last
+                    else min(win_end, cursor + _CREP_MAX_LINE_WINDOW_S)
                 )
-                gap_words: list[dict] = []
-                for aseg in aligned.get('segments', []):
-                    gap_words.extend(aseg.get('words', []))
-                gap_words.sort(key=lambda w: float(w.get('start', 0)))
-            except Exception as exc:
-                if job_log:
-                    job_log.warning(
-                        f"[crep] align failed for block [{bi}–{bj}]: {exc}",
-                        stage="transcribe",
-                    )
-                continue
+                line_seg = {'text': cand_text, 'start': cursor, 'end': line_win_end}
 
-            if not gap_words:
+                try:
+                    aligned_line = _wx.align(
+                        [line_seg], _amodel, _ameta, _audio_data, _device,
+                        return_char_alignments=False,
+                    )
+                    line_words: list[dict] = []
+                    for aseg in aligned_line.get('segments', []):
+                        line_words.extend(aseg.get('words', []))
+                    line_words.sort(key=lambda w: float(w.get('start', 0)))
+                except Exception as exc:
+                    if job_log:
+                        job_log.warning(
+                            f"[crep] align failed for block [{bi}–{bj}] "
+                            f"line {ci} '{cand_text[:30]}': {exc}",
+                            stage="transcribe",
+                        )
+                    align_aborted = True
+                    break
+
+                # If bounded window returned nothing, retry with full remaining window
+                if not line_words and not is_last:
+                    try:
+                        wide_seg     = {'text': cand_text, 'start': cursor, 'end': win_end}
+                        aligned_wide = _wx.align(
+                            [wide_seg], _amodel, _ameta, _audio_data, _device,
+                            return_char_alignments=False,
+                        )
+                        line_words = []
+                        for aseg in aligned_wide.get('segments', []):
+                            line_words.extend(aseg.get('words', []))
+                        line_words.sort(key=lambda w: float(w.get('start', 0)))
+                    except Exception:
+                        pass
+
+                if not line_words:
+                    if job_log:
+                        job_log.info(
+                            f"[crep] Block [{bi}–{bj}] line {ci}: no words — abort block",
+                            stage="transcribe",
+                        )
+                    align_aborted = True
+                    break
+
+                scores     = [float(w['score']) for w in line_words if 'score' in w]
+                line_score = sum(scores) / len(scores) if scores else 0.0
+                w_start    = min(float(w.get('start', cursor))   for w in line_words)
+                w_end      = max(float(w.get('end',   cursor))   for w in line_words)
+                ln_start   = max(cursor, w_start - 0.10)
+                ln_end     = w_end + 0.08
+
                 if job_log:
                     job_log.info(
-                        f"[crep] Block [{bi}–{bj}]: no words returned — skip",
+                        f"[crep] Block [{bi}–{bj}] line {ci}: "
+                        f"{ln_start:.2f}–{ln_end:.2f}s score={line_score:.3f} "
+                        f"'{cand_text[:30]}'",
                         stage="transcribe",
                     )
+
+                new_lines.append({
+                    'text':           cand_text,
+                    'start':          ln_start,
+                    'end':            ln_end,
+                    'words':          line_words,
+                    '_timing_source': 'crep_fix',
+                })
+                cursor = ln_end  # next line starts where this one ended
+
+            if align_aborted or not new_lines:
                 continue
 
-            first_w    = min(w.get('start', win_end)   for w in gap_words)
-            last_w     = max(w.get('end',   win_start) for w in gap_words)
-            coverage   = (last_w - first_w) / max(0.001, win_end - win_start)
-            scores     = [float(w['score']) for w in gap_words if 'score' in w]
-            mean_score = sum(scores) / len(scores) if scores else 0.0
+            # Score guard across all re-aligned words
+            all_words_block = [w for nl in new_lines for w in nl.get('words', [])]
+            all_scores      = [float(w['score']) for w in all_words_block if 'score' in w]
+            mean_score      = sum(all_scores) / len(all_scores) if all_scores else 0.0
 
-            if job_log:
-                job_log.info(
-                    f"[crep] Block [{bi}–{bj}]: realigned {first_w:.2f}–{last_w:.2f}s "
-                    f"coverage={coverage:.2f} mean_score={mean_score:.3f}",
-                    stage="transcribe",
-                )
-
-            if coverage < _REPEAT_MIN_COVERAGE or mean_score < _REPEAT_MIN_WORD_SCORE:
+            if mean_score < _REPEAT_MIN_WORD_SCORE:
                 if job_log:
                     job_log.info(
-                        f"[crep] Block [{bi}–{bj}]: rejected "
-                        f"(coverage={coverage:.2f} mean_score={mean_score:.3f})",
+                        f"[crep] Block [{bi}–{bj}]: rejected (mean_score={mean_score:.3f})",
                         stage="transcribe",
                     )
-                continue
-
-            eff_seg   = {'start': win_start, 'end': win_end, 'text': '', 'words': gap_words}
-            new_lines = _split_by_word_gaps(
-                gap_words, cand_texts, eff_seg, job_log=job_log, seg_id=-2,
-            )
-
-            if not new_lines:
                 continue
 
             _tol = 2.0
             if not all(
-                win_start - _tol <= l.get('start', 0.0) <= win_end + _tol
-                for l in new_lines
+                win_start - _tol <= nl.get('start', 0.0) <= win_end + _tol
+                for nl in new_lines
             ):
                 if job_log:
                     job_log.warning(
@@ -3062,13 +3104,10 @@ def _fix_compressed_repeats(
                     )
                 continue
 
-            for nl in new_lines:
-                nl['_timing_source'] = 'crep_fix'
-
             if job_log:
                 job_log.info(
                     f"[crep] Block [{bi}–{bj}]: replaced → "
-                    f"{[(round(l['start'], 2), round(l['end'], 2)) for l in new_lines]}",
+                    f"{[(round(nl['start'], 2), round(nl['end'], 2)) for nl in new_lines]}",
                     stage="transcribe",
                 )
 
