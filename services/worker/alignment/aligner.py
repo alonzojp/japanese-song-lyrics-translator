@@ -2945,9 +2945,34 @@ def _fix_compressed_repeats(
         for bi, bj in suspect_blocks:
             ri    = bi + idx_offset
             rj    = bj + idx_offset
+
+            # Extend block backwards through short contiguous lines that aren't
+            # timeline-repeats — they were squashed by the same CTC event but
+            # escaped detection because they're the first occurrence of their text.
+            while ri > 0:
+                prev     = result[ri - 1]
+                prev_dur = prev.get('end', 0.0) - prev.get('start', 0.0)
+                gap      = result[ri].get('start', 0.0) - prev.get('end', 0.0)
+                if prev_dur < _CREP_SHORT_ABS_S and gap <= 0.5:
+                    ri -= 1
+                    if job_log:
+                        job_log.info(
+                            f"[crep] Block [{bi}–{bj}]: extended backwards to "
+                            f"include index {ri} (dur={prev_dur:.2f}s gap={gap:.2f}s)",
+                            stage="transcribe",
+                        )
+                else:
+                    break
+
             block = result[ri:rj + 1]
 
-            win_start = block[0].get('start', 0.0)
+            # Start the alignment window from the previous line's end so we cover
+            # any audio that leaked into the gap before the block's first line.
+            win_start = (
+                result[ri - 1].get('end', block[0].get('start', 0.0))
+                if ri > 0
+                else block[0].get('start', 0.0)
+            )
             win_end   = result[rj + 1].get('start') if rj + 1 < len(result) else None
 
             if win_end is None:
