@@ -2995,6 +2995,16 @@ def _fix_compressed_repeats(
 
             cand_texts = [l.get('text', '') for l in block]
 
+            # Reference durations from first occurrences before the block — used
+            # to set tight per-line windows so the CTC model only sees one
+            # occurrence of each phrase and can't stretch across its neighbour.
+            ref_durs: dict[str, float] = {}
+            for _ln in result[:ri]:
+                _norm = _normalize_for_matching(_ln.get('text', ''))
+                _dur  = _ln.get('end', 0.0) - _ln.get('start', 0.0)
+                if _norm not in ref_durs and _dur > 0.5:
+                    ref_durs[_norm] = _dur
+
             # Align each line SEPARATELY in a bounded window so CTC can never
             # see the same text twice in one call and dedup it again.
             new_lines: list[dict] = []
@@ -3003,9 +3013,14 @@ def _fix_compressed_repeats(
 
             for ci, cand_text in enumerate(cand_texts):
                 is_last     = (ci == len(cand_texts) - 1)
+                # Cap window to ref_dur + 1s so the next line's audio
+                # doesn't bleed in and cause CTC to spread this line's chars.
+                _norm_c  = _normalize_for_matching(cand_text)
+                _ref     = ref_durs.get(_norm_c, _CREP_MAX_LINE_WINDOW_S)
+                _line_cap = min(_CREP_MAX_LINE_WINDOW_S, _ref + 1.0)
                 line_win_end = (
                     win_end if is_last
-                    else min(win_end, cursor + _CREP_MAX_LINE_WINDOW_S)
+                    else min(win_end, cursor + _line_cap)
                 )
                 line_seg = {'text': cand_text, 'start': cursor, 'end': line_win_end}
 
