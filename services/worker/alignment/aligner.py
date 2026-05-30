@@ -972,7 +972,9 @@ def _apply_vad_anchor(
     """
     if not words:
         return words, 0.0
-    first_t = words[0].get('start')
+    # Words without 'start' sort to position 0 (default 0.0) and must be skipped;
+    # using words[0] directly would return None and silently abort the anchor.
+    first_t = next((w.get('start') for w in words if w.get('start') is not None), None)
     if first_t is None:
         return words, 0.0
 
