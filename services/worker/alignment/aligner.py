@@ -42,8 +42,8 @@ _VOCAL_ENERGY_THRESHOLD   = 0.015  # RMS below this = silence/instrumental (no v
 # When Whisper's deduplication skips a repeated section, text_first leaves a
 # large vocal-energy gap.  These constants control the post-reconstruction pass
 # that detects such gaps and runs a targeted forced alignment to fill them.
-_REPEAT_GAP_THRESH_S    = 8.0    # gaps shorter than this are pauses, not repeat zones
-_REPEAT_GAP_MAX_S       = 22.0   # gaps longer than this are likely instrumentals, not repeats
+_REPEAT_GAP_THRESH_S    = 4.0    # gaps shorter than this are pauses, not repeat zones
+_REPEAT_GAP_MAX_S       = 35.0   # gaps longer than this are likely instrumentals, not repeats
 _REPEAT_MIN_ENERGY      = 0.025  # RMS below this = no vocal — skip the gap
 _REPEAT_MAX_LOOKBACK    = 4      # max official lines to try as repeat candidates
 _REPEAT_MIN_COVERAGE    = 0.40   # min word-coverage fraction to accept an alignment
@@ -61,6 +61,8 @@ _CREP_SHORT_ABS_S        = 2.00   # non-last block-line flagged when duration be
 _CREP_BLOCK_MIN_LINES    = 2      # minimum consecutive repeat lines to trigger
 _CREP_WINDOW_MAX_S       = 45.0   # skip when distance to next anchor exceeds this
 _CREP_MAX_LINE_WINDOW_S  = 10.0   # per-line window cap (keeps each CTC call to one occurrence)
+_CREP_MIN_WORD_SCORE     = 0.30   # lower acceptance threshold for crep re-alignment (CTC scores
+                                   # for repeated audio are inherently lower than first-pass)
 
 # ── Feature flags ─────────────────────────────────────────────────────────────
 # Phase 1: text-informed segment mapping (char bigrams + English anchors + greedy monotone).
@@ -3099,10 +3101,10 @@ def _fix_compressed_repeats(
             all_scores      = [float(w['score']) for w in all_words_block if 'score' in w]
             mean_score      = sum(all_scores) / len(all_scores) if all_scores else 0.0
 
-            if mean_score < _REPEAT_MIN_WORD_SCORE:
+            if mean_score < _CREP_MIN_WORD_SCORE:
                 if job_log:
                     job_log.info(
-                        f"[crep] Block [{bi}–{bj}]: rejected (mean_score={mean_score:.3f})",
+                        f"[crep] Block [{bi}–{bj}]: rejected (mean_score={mean_score:.3f} < {_CREP_MIN_WORD_SCORE})",
                         stage="transcribe",
                     )
                 continue
