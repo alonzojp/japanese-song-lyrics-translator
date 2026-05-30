@@ -1931,6 +1931,13 @@ def _align_whisperx_with_official_lyrics(
                 reconstructed = _fix_compressed_repeats(
                     reconstructed, official_lines, audio_path, job_log
                 )
+                # Re-align fallback lines (synthetic equal-duration slots from
+                # text_first when no words matched) using per-line CTC with vocal-
+                # onset anchoring.  Must run before the proactive fill so that
+                # formerly-fallback lines count as covered and aren't re-inserted.
+                reconstructed = _realign_fallback_lines(
+                    reconstructed, official_lines, audio_path, job_log
+                )
                 # Proactive repeat detection: find any remaining vocal audio not
                 # covered by a matched line (unclaimed words OR acoustic gaps) and
                 # match ALL previously seen official lines as repeat candidates.
@@ -2155,6 +2162,22 @@ def _is_pathological_split(
 
 
 # ── Vocal energy probe ────────────────────────────────────────────────────────
+
+def _find_vocal_onset(audio_path: Path, start: float, end: float, hop: float = 0.15) -> Optional[float]:
+    """
+    Scan [start, end] in hop-sized steps and return the first timestamp where
+    RMS energy exceeds _REPEAT_MIN_ENERGY (vocal present).
+    Returns None if no vocal onset is found.
+    Used to anchor CTC word timestamps to the actual singing start rather than
+    to the window boundary (which may precede singing by a musical pause).
+    """
+    t = start
+    while t + hop <= end:
+        if _vocal_energy_in_window(audio_path, t, t + hop) >= _REPEAT_MIN_ENERGY:
+            return t
+        t += hop
+    return None
+
 
 def _vocal_energy_in_window(audio_path: Path, start: float, end: float) -> float:
     """
@@ -2595,6 +2618,208 @@ def _audit_boundaries(lines: list[dict], job_log) -> None:
         f"[AUDIT] ══════ end audit ══════",
         stage="align",
     )
+
+
+# ── Fallback-line re-alignment ────────────────────────────────────────────────
+
+def _realign_fallback_lines(
+    lines:          list[dict],
+    official_lines: list[dict],
+    audio_path:     Path,
+    job_log,
+) -> list[dict]:
+    """
+    Find contiguous sequences of text_first_fallback lines (synthetic equal-
+    duration slots created when text_first found no matching words) and attempt
+    per-line CTC re-alignment in the audio window bounded by adjacent matched
+    lines.  Each fallback line is aligned separately with a cursor that advances
+    through the block, and words are anchored to the vocal onset so CTC lag
+    does not accumulate.  The block is only accepted when the mean word score
+    meets _CREP_MIN_WORD_SCORE.
+    """
+    sorted_lines = sorted(lines, key=lambda l: l.get('start', 0.0))
+
+    fallback_seqs: list[tuple[int, int]] = []
+    i = 0
+    while i < len(sorted_lines):
+        if sorted_lines[i].get('_timing_source') == 'text_first_fallback':
+            j = i + 1
+            while j < len(sorted_lines) and sorted_lines[j].get('_timing_source') == 'text_first_fallback':
+                j += 1
+            fallback_seqs.append((i, j - 1))
+            i = j
+        else:
+            i += 1
+
+    if not fallback_seqs:
+        return sorted_lines
+
+    if job_log:
+        job_log.info(
+            f'[fallback_realign] {len(fallback_seqs)} fallback sequence(s) to attempt',
+            stage='transcribe',
+        )
+
+    probe_path = audio_path.parent / 'vocals_asr.wav'
+    if not probe_path.exists():
+        probe_path = audio_path
+
+    try:
+        import whisperx as _wx
+        _device     = _get_device()
+        _audio_data = _wx.load_audio(str(audio_path))
+        _amodel, _ameta = _wx.load_align_model(language_code=WHISPER_LANGUAGE, device=_device)
+    except Exception as exc:
+        if job_log:
+            job_log.warning(f'[fallback_realign] WhisperX unavailable: {exc}', stage='transcribe')
+        return sorted_lines
+
+    # Known durations from non-fallback lines (for per-line window estimation)
+    known_durs: dict[str, float] = {}
+    for ln in sorted_lines:
+        if ln.get('_timing_source') == 'text_first_fallback':
+            continue
+        dur = ln.get('end', 0.0) - ln.get('start', 0.0)
+        if dur > 0.5:
+            k = _normalize_for_matching(ln.get('text', ''))
+            if k not in known_durs:
+                known_durs[k] = dur
+    avg_dur = (sum(known_durs.values()) / len(known_durs)) if known_durs else 3.5
+
+    result      = list(sorted_lines)
+    idx_offset  = 0
+
+    try:
+        for bi, bj in fallback_seqs:
+            ri = bi + idx_offset
+            rj = bj + idx_offset
+
+            win_start = (
+                result[ri - 1].get('end', result[ri].get('start', 0.0))
+                if ri > 0
+                else result[ri].get('start', 0.0)
+            )
+            if rj + 1 < len(result):
+                win_end = result[rj + 1].get('start')
+            else:
+                try:
+                    import soundfile as sf
+                    win_end = sf.info(str(audio_path)).duration
+                except Exception:
+                    win_end = None
+
+            if win_end is None or win_end - win_start > 45.0 or win_end - win_start < 0.5:
+                if job_log:
+                    job_log.info(
+                        f'[fallback_realign] Seq [{bi}–{bj}]: window '
+                        f'{win_end - win_start if win_end else "?":.1f}s out of range — skip',
+                        stage='transcribe',
+                    )
+                continue
+
+            energy = _vocal_energy_in_window(probe_path, win_start, win_end)
+            if energy < _REPEAT_MIN_ENERGY:
+                if job_log:
+                    job_log.info(
+                        f'[fallback_realign] Seq [{bi}–{bj}]: no vocal energy ({energy:.4f}) — skip',
+                        stage='transcribe',
+                    )
+                continue
+
+            fallback_block = result[ri:rj + 1]
+            cand_texts     = [ln.get('text', '') for ln in fallback_block]
+            new_lines:  list[dict] = []
+            cursor      = win_start
+            align_aborted = False
+
+            for ci, cand_text in enumerate(cand_texts):
+                is_last  = (ci == len(cand_texts) - 1)
+                _ref     = known_durs.get(_normalize_for_matching(cand_text), avg_dur)
+                _cap     = min(_CREP_MAX_LINE_WINDOW_S, _ref + 1.5)
+                line_win_end = win_end if is_last else min(win_end, cursor + _cap)
+
+                line_seg = {'text': cand_text, 'start': cursor, 'end': line_win_end}
+                try:
+                    aligned_line = _wx.align(
+                        [line_seg], _amodel, _ameta, _audio_data, _device,
+                        return_char_alignments=False,
+                    )
+                    line_words: list[dict] = []
+                    for aseg in aligned_line.get('segments', []):
+                        line_words.extend(aseg.get('words', []))
+                    line_words.sort(key=lambda w: float(w.get('start', 0)))
+                except Exception as exc:
+                    if job_log:
+                        job_log.warning(
+                            f'[fallback_realign] align failed line {ci} "{cand_text[:30]}": {exc}',
+                            stage='transcribe',
+                        )
+                    align_aborted = True
+                    break
+
+                if not line_words:
+                    align_aborted = True
+                    break
+
+                _onset  = _find_vocal_onset(probe_path, cursor, line_win_end)
+                _anchor = _onset if _onset is not None else cursor
+                line_words, _ = _apply_vad_anchor(line_words, _anchor, ci, job_log)
+
+                w_start  = min(float(w.get('start', cursor)) for w in line_words)
+                w_end    = max(float(w.get('end',   cursor)) for w in line_words)
+                ln_start = max(cursor, w_start - 0.10)
+                ln_end   = w_end + 0.08
+
+                if job_log:
+                    job_log.info(
+                        f'[fallback_realign] Seq [{bi}–{bj}] line {ci}: '
+                        f'{ln_start:.2f}–{ln_end:.2f}s "{cand_text[:30]}"',
+                        stage='transcribe',
+                    )
+
+                new_lines.append({
+                    'text':           cand_text,
+                    'start':          ln_start,
+                    'end':            ln_end,
+                    'words':          line_words,
+                    '_timing_source': 'fallback_realign',
+                })
+                cursor = ln_end
+
+            if align_aborted or not new_lines:
+                continue
+
+            all_scores = [
+                float(w['score'])
+                for nl in new_lines
+                for w in nl.get('words', [])
+                if 'score' in w
+            ]
+            mean_score = sum(all_scores) / len(all_scores) if all_scores else 0.0
+
+            if mean_score < _CREP_MIN_WORD_SCORE:
+                if job_log:
+                    job_log.info(
+                        f'[fallback_realign] Seq [{bi}–{bj}]: rejected score={mean_score:.3f}',
+                        stage='transcribe',
+                    )
+                continue
+
+            if job_log:
+                job_log.info(
+                    f'[fallback_realign] Seq [{bi}–{bj}]: '
+                    f'replaced {len(fallback_block)} fallback → {len(new_lines)} realigned '
+                    f'score={mean_score:.3f}',
+                    stage='transcribe',
+                )
+
+            result      = result[:ri] + new_lines + result[rj + 1:]
+            idx_offset += len(new_lines) - (rj - ri + 1)
+    finally:
+        del _amodel
+        _free_vram()
+
+    return sorted(result, key=lambda l: l.get('start', 0.0))
 
 
 # ── Proactive repeat fill ─────────────────────────────────────────────────────
@@ -3156,6 +3381,10 @@ def _fix_compressed_repeats(
 
     sorted_lines = sorted(lines, key=lambda l: l.get('start', 0.0))
 
+    probe_path = audio_path.parent / 'vocals_asr.wav'
+    if not probe_path.exists():
+        probe_path = audio_path
+
     # Mark each line as a timeline repeat (same normalized text seen earlier)
     seen_texts: set[str] = set()
     is_repeat: list[bool] = []
@@ -3340,6 +3569,13 @@ def _fix_compressed_repeats(
                         )
                     align_aborted = True
                     break
+
+                # Anchor words to the actual vocal onset within this line's window
+                # so CTC lag (words placed 100-2500ms after true onset) doesn't
+                # accumulate across sequential lines in the block.
+                _onset   = _find_vocal_onset(probe_path, cursor, line_win_end)
+                _anchor  = _onset if _onset is not None else cursor
+                line_words, _ = _apply_vad_anchor(line_words, _anchor, ci, job_log)
 
                 scores     = [float(w['score']) for w in line_words if 'score' in w]
                 line_score = sum(scores) / len(scores) if scores else 0.0
