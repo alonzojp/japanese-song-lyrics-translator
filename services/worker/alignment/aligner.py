@@ -1931,6 +1931,14 @@ def _align_whisperx_with_official_lyrics(
                 reconstructed = _fix_compressed_repeats(
                     reconstructed, official_lines, audio_path, job_log
                 )
+                # Proactive repeat detection: find any remaining vocal audio not
+                # covered by a matched line (unclaimed words OR acoustic gaps) and
+                # match ALL previously seen official lines as repeat candidates.
+                # Unlike _fill_repeat_gaps this is not limited to a lookback window,
+                # so it catches choruses repeating after long verse sections.
+                reconstructed = _proactive_repeat_fill(
+                    reconstructed, official_lines, global_words, audio_path, job_log
+                )
                 return reconstructed, "whisperx_official"
     except Exception as _tf_exc:
         if job_log:
@@ -2587,6 +2595,270 @@ def _audit_boundaries(lines: list[dict], job_log) -> None:
         f"[AUDIT] ══════ end audit ══════",
         stage="align",
     )
+
+
+# ── Proactive repeat fill ─────────────────────────────────────────────────────
+
+def _proactive_repeat_fill(
+    lines:          list[dict],
+    official_lines: list[dict],
+    all_words:      list[dict],
+    audio_path:     Path,
+    job_log,
+) -> list[dict]:
+    """
+    Proactive repeat detection: find vocal audio not covered by any matched line
+    and try to match official lines against it.
+
+    Unlike _fill_repeat_gaps (which looks backwards from the previous line),
+    this pass searches ALL previously matched official line indices as repeat
+    candidates.  This fixes the core lookback limitation: a chorus that repeats
+    after a long verse is missed when the verse's official index is more than
+    _REPEAT_MAX_LOOKBACK positions ahead of the chorus in official_lines.
+
+    Two passes:
+    1. Word-based  — unclaimed Whisper words → text_first matching → insert.
+    2. Acoustic    — vocal-energy gaps with no Whisper words → CTC with
+                     candidates drawn from all previously matched official indices.
+    """
+    if not lines or not official_lines or not all_words:
+        return lines
+
+    from alignment.text_first import (
+        _match_line as _tf_match,
+        _norm       as _tf_norm,
+    )
+
+    def _log(msg: str) -> None:
+        if job_log:
+            job_log.info(msg, stage='transcribe')
+
+    # Pre-compute normalised official line texts
+    off_norms: list[str] = [_tf_norm(ln.get('text', '')) for ln in official_lines]
+
+    # Official normalised text → first occurrence index (for building candidate lists)
+    off_norm_to_idx: dict[str, int] = {}
+    for li, n in enumerate(off_norms):
+        if n and n not in off_norm_to_idx:
+            off_norm_to_idx[n] = li
+
+    # ── Pass 1: unclaimed-word matching ──────────────────────────────────────
+    # Words in all_words that weren't consumed by any non-fallback result line
+    # are potential repeats that Whisper produced but text_first passed over.
+
+    claimed_ms: set[int] = set()
+    for ln in lines:
+        if ln.get('_timing_source') == 'text_first_fallback':
+            continue
+        for w in ln.get('words', []):
+            s = w.get('start')
+            if s is not None:
+                claimed_ms.add(round(float(s) * 1000))
+
+    unclaimed = sorted(
+        (w for w in all_words
+         if w.get('word', '').strip()
+         and w.get('start') is not None
+         and round(float(w['start']) * 1000) not in claimed_ms),
+        key=lambda w: float(w['start']),
+    )
+
+    if unclaimed:
+        _log(f'[proactive] Pass 1: {len(unclaimed)} unclaimed words')
+
+        # Group into time-contiguous clusters (gap > 2.5 s = new cluster)
+        clusters: list[list[dict]] = []
+        cur: list[dict] = [unclaimed[0]]
+        for w in unclaimed[1:]:
+            gap = float(w['start']) - float(cur[-1].get('end', cur[-1]['start']))
+            if gap < 2.5:
+                cur.append(w)
+            else:
+                if len(cur) >= _REPEAT_MIN_W:
+                    clusters.append(cur)
+                cur = [w]
+        if len(cur) >= _REPEAT_MIN_W:
+            clusters.append(cur)
+
+        for cluster in clusters:
+            cl_s = float(cluster[0]['start'])
+            cl_e = float(cluster[-1].get('end', cluster[-1]['start']))
+            _log(f'[proactive] P1 cluster {cl_s:.1f}–{cl_e:.1f}s ({len(cluster)} words)')
+
+            ptr   = 0
+            added: list[dict] = []
+            for li, off_line in enumerate(official_lines):
+                text = off_line.get('text', '').strip()
+                if not text:
+                    continue
+                next_n = next((off_norms[j] for j in range(li + 1, len(official_lines)) if off_norms[j]), '')
+                matched, new_ptr, cov = _tf_match(off_norms[li], next_n, cluster, ptr)
+                if matched and cov >= _REPEAT_MIN_COVERAGE:
+                    ws = float(matched[0]['start'])
+                    we = float(matched[-1].get('end', matched[-1]['start']))
+                    rs = max(0.0, round(ws - 0.10, 3))
+                    re = round(we + 0.08, 3)
+                    is_dup = any(
+                        abs(ex.get('start', 0) - rs) < 1.0 and ex.get('text') == text
+                        for ex in lines + added
+                    )
+                    if not is_dup:
+                        added.append({
+                            'text':           text,
+                            'start':          rs,
+                            'end':            re,
+                            'words':          matched,
+                            '_timing_source': 'proactive_repeat',
+                        })
+                        _log(f'[proactive] P1 "{text[:40]}" {rs:.2f}–{re:.2f}s cov={cov:.0%}')
+                    ptr = new_ptr
+
+            if added:
+                lines = sorted(lines + added, key=lambda l: l.get('start', 0.0))
+                # Refresh claimed_ms so later clusters don't double-claim
+                for nl in added:
+                    for w in nl.get('words', []):
+                        s = w.get('start')
+                        if s is not None:
+                            claimed_ms.add(round(float(s) * 1000))
+
+    # ── Pass 2: acoustic gaps (Whisper deduped — no words in gap) ─────────────
+    # Build set of all official indices that appear in the current result.
+    # These are the candidates for repeating: any of them could appear again.
+    matched_off_indices: list[int] = []
+    seen_idx: set[int] = set()
+    for ln in sorted(lines, key=lambda l: l.get('start', 0.0)):
+        norm = _tf_norm(ln.get('text', ''))
+        idx  = off_norm_to_idx.get(norm)
+        if idx is not None and idx not in seen_idx:
+            matched_off_indices.append(idx)
+            seen_idx.add(idx)
+
+    if not matched_off_indices:
+        return sorted(lines, key=lambda l: l.get('start', 0.0))
+
+    asr_path   = audio_path.parent / 'vocals_asr.wav'
+    probe_path = asr_path if asr_path.exists() else audio_path
+
+    sorted_lines = sorted(lines, key=lambda l: l.get('start', 0.0))
+
+    # Map all Whisper word starts to ms for fast gap-word presence check
+    all_word_ms: set[int] = {
+        round(float(w['start']) * 1000)
+        for w in all_words if w.get('start') is not None
+    }
+
+    def _gap_has_words(t0: float, t1: float) -> bool:
+        lo, hi = round(t0 * 1000) - 200, round(t1 * 1000) + 200
+        return any(lo <= ms <= hi for ms in all_word_ms)
+
+    acoustic_gaps: list[tuple[float, float, int]] = []
+    for i in range(1, len(sorted_lines)):
+        g_s = sorted_lines[i - 1].get('end', 0.0)
+        g_e = sorted_lines[i].get('start', 0.0)
+        dur = g_e - g_s
+        if dur < 2.0 or dur > _REPEAT_GAP_MAX_S:
+            continue
+        if _gap_has_words(g_s, g_e):
+            continue   # Pass 1 handles word-populated gaps
+        energy = _vocal_energy_in_window(probe_path, g_s, g_e)
+        if energy < _REPEAT_MIN_ENERGY:
+            continue
+        acoustic_gaps.append((g_s, g_e, i))
+        _log(f'[proactive] P2 gap {g_s:.1f}–{g_e:.1f}s energy={energy:.4f}')
+
+    if not acoustic_gaps:
+        return sorted(lines, key=lambda l: l.get('start', 0.0))
+
+    try:
+        import whisperx as _wx
+        _device     = _get_device()
+        _audio_data = _wx.load_audio(str(audio_path))
+        _amodel, _ameta = _wx.load_align_model(language_code=WHISPER_LANGUAGE, device=_device)
+    except Exception as exc:
+        _log(f'[proactive] P2 WhisperX unavailable: {exc}')
+        return sorted(lines, key=lambda l: l.get('start', 0.0))
+
+    line_durs = [
+        ln.get('end', 0) - ln.get('start', 0)
+        for ln in lines
+        if ln.get('_timing_source') not in ('text_first_fallback',)
+        and ln.get('end', 0) - ln.get('start', 0) > 0.5
+    ]
+    avg_dur = (sum(line_durs) / len(line_durs)) if line_durs else 3.5
+
+    _MAX_CTC_PER_GAP = 8   # bound performance: at most this many CTC calls per gap
+
+    try:
+        for g_s, g_e, _insert_before in acoustic_gaps:
+            n_estimate = max(1, round((g_e - g_s) / avg_dur))
+
+            best_lines:    Optional[list[dict]] = None
+            best_coverage: float                = 0.0
+            ctc_calls = 0
+            found = False
+
+            # Try candidates from ALL matched official indices, most-recent first.
+            # This is the key difference from _fill_repeat_gaps: we're not limited
+            # to looking back from the previous line's official index.
+            for start_idx in reversed(matched_off_indices):
+                if found or ctc_calls >= _MAX_CTC_PER_GAP:
+                    break
+                for n_lines in range(1, min(n_estimate + 2, _REPEAT_MAX_LOOKBACK + 1)):
+                    if ctc_calls >= _MAX_CTC_PER_GAP:
+                        break
+                    end_idx    = min(start_idx + n_lines, len(official_lines))
+                    cand_texts = [official_lines[j]['text'] for j in range(start_idx, end_idx)]
+                    gap_seg    = {'text': ' '.join(cand_texts), 'start': g_s, 'end': g_e}
+                    ctc_calls += 1
+                    try:
+                        aligned = _wx.align([gap_seg], _amodel, _ameta, _audio_data, _device,
+                                            return_char_alignments=False)
+                        gap_words: list[dict] = []
+                        for _seg in aligned.get('segments', []):
+                            gap_words.extend(_seg.get('words', []))
+                        gap_words.sort(key=lambda w: float(w.get('start', 0)))
+                    except Exception:
+                        continue
+
+                    if not gap_words:
+                        continue
+
+                    first_w  = min(w.get('start', g_e)   for w in gap_words)
+                    last_w   = max(w.get('end',   g_s)   for w in gap_words)
+                    coverage = (last_w - first_w) / max(0.001, g_e - g_s)
+                    scores   = [float(w['score']) for w in gap_words if 'score' in w]
+                    mean_sc  = sum(scores) / len(scores) if scores else 1.0
+
+                    if coverage > best_coverage and mean_sc >= _CREP_MIN_WORD_SCORE:
+                        best_coverage = coverage
+                        w_copy, _    = _apply_vad_anchor(list(gap_words), g_s, -1, None)
+                        eff_seg      = {'start': g_s, 'end': g_e, 'text': '', 'words': w_copy}
+                        best_lines   = _split_by_word_gaps(
+                            w_copy, cand_texts, eff_seg, job_log=job_log, seg_id=-1,
+                        )
+                    if best_coverage >= _REPEAT_MIN_COVERAGE:
+                        found = True
+                        break
+
+            if best_lines and best_coverage >= _REPEAT_MIN_COVERAGE:
+                for nl in best_lines:
+                    nl['_timing_source'] = 'proactive_acoustic'
+                    is_dup = any(
+                        abs(ex.get('start', 0) - nl.get('start', 0)) < 1.0
+                        and ex.get('text') == nl.get('text', '')
+                        for ex in lines
+                    )
+                    if not is_dup:
+                        lines.append(nl)
+                        _log(f'[proactive] P2 "{nl.get("text","")[:40]}" '
+                             f'{nl.get("start",0):.2f}–{nl.get("end",0):.2f}s '
+                             f'cov={best_coverage:.2f}')
+    finally:
+        del _amodel
+        _free_vram()
+
+    return sorted(lines, key=lambda l: l.get('start', 0.0))
 
 
 # ── Repeat-gap fill ──────────────────────────────────────────────────────────
